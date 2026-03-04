@@ -1,0 +1,19 @@
+# Logs
+logs/
+
+# Checkpoints and temp files
+checkpoints/
+*.temp.epub
+*.json.tmp
+
+# Environment
+.env
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
