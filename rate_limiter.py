@@ -10,8 +10,10 @@ class ModelType(Enum):
     """Enum representing supported Gemini model types."""
     GEMINI_2_5_FLASH = "gemini-2.5-flash"
     GEMINI_2_5_PRO = "gemini-2.5-pro"
-    GEMINI_3_FLASH = "gemini-3-flash"
+    GEMINI_3_FLASH = "gemini-3-flash-preview"
     GEMINI_3_1_PRO = "gemini-3.1-pro"
+    GEMINI_2_5_FLASH_LITE = "gemini-2.5-flash-lite"
+    GEMINI_3_1_FLASH_LITE = "gemini-3.1-flash-lite-preview"
 
 @dataclass
 class ModelLimits:
@@ -58,11 +60,11 @@ class ModelLimits:
         try:
             tpm = max(0, int(data.get("tpm", 250000)))
             tpd = max(0, int(data.get("tpd", 1000000)))
-            rpd = max(0, int(data.get("rpd", 500)))
-            rpm = max(0, int(data.get("rpm", 15)))
-            max_chapters_per_day = max(0, int(data.get("max_chapters_per_day", 78)))
+            rpd = max(0, int(data.get("rpd", 20)))
+            rpm = max(0, int(data.get("rpm", 5)))
+            max_chapters_per_day = max(0, int(data.get("max_chapters_per_day", 20)))
             tokens_per_chapter = max(1, int(data.get("tokens_per_chapter", 3200)))
-            max_input_tokens = max(1000, int(data.get("max_input_tokens", 30000)))
+            max_input_tokens = max(1000, int(data.get("max_input_tokens", 1000000)))
             limits = cls(
                 tpm=tpm,
                 tpd=tpd,
@@ -88,10 +90,9 @@ class ModelLimits:
             return cls(
                 tpm=data.get("tpm", 250000),
                 tpd=data.get("tpd", 1000000),
-                rpd=data.get("rpd", 500),
-                rpm=data.get("rpm", 15),
-                max_chapters_per_day=data.get("max_chapters_per_day", 78),
+                rpd=data.get("rpd", 20),
+                rpm=data.get("rpm", 5),
+                max_chapters_per_day=data.get("max_chapters_per_day", 20),
                 tokens_per_chapter=data.get("tokens_per_chapter", 3200),
-                max_input_tokens=data.get("max_input_tokens", 30000)
+                max_input_tokens=data.get("max_input_tokens", 1000000)
             )
-            

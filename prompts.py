@@ -1,73 +1,41 @@
 from typing import Dict, Tuple
 
-def create_ner_prompt(text: str, source_lang: str) -> str:
-    """ Creates prompt for named entity recognition, focusing on PERSON and ORGANIZATION. """
-    return f"""Identify specific named entities in the following {source_lang} text. Focus exclusively on:
+def create_ner_prompt(text: str, source_lang: str, target_lang: str, is_japanese_webnovel: bool = False) -> str:
+    """ Creates a combined prompt for Named Entity Recognition AND Translation in a single pass. """
+    
+    shared_alphabet_rule = (
+        f"**CRITICAL ALPHABET RULE:** If {source_lang} and {target_lang} use the same alphabet/script "
+        f"(e.g., German to English, Spanish to French), you MUST return the exact original entity text unchanged "
+        f"in the 'translation' field. Do NOT abbreviate names, do NOT use initials, and do NOT drop last names."
+    )
+
+    jpn_instruction = ""
+    if is_japanese_webnovel and source_lang.lower() in ['chinese', 'zh', 'cn']:
+        jpn_instruction = "- **CRITICAL FOR JAPANESE:** Provide the original Japanese reading (romaji) of the name, not the Chinese reading (e.g., '日葵' -> 'Himawari')."
+
+    return f"""Identify specific named entities in the following {source_lang} text and provide their highly accurate {target_lang} equivalent.
+
+Focus exclusively on:
 - **PERSON** names: Names of specific individuals or fictional characters.
-- **ORGANIZATION** names: Names of companies, institutions, schools, teams, brands, etc.
+- **ORGANIZATION** names: Companies, institutions, schools, teams, brands, etc.
 
-**Strict Rules for Identification:**
-- Extract the **exact text** of the entity as it appears in the input text.
-- **Only PERSON and ORGANIZATION entities should be identified for transliteration**.
-- **Exclude** common words, generic nouns, adjectives, or verbs.
-- **Exclude** simple geographic locations unless part of a specific organization name.
-- **Exclude** cultural terms, plant names, or other proper nouns that are not PERSON or ORGANIZATION.
-- Avoid including entities that are only common terms.
-- Prioritize clear proper nouns over potential ambiguous terms.
-
-**Translation and Transliteration Instructions:**
-- For identified PERSON and ORGANIZATION entities, the entity text will be used for transliteration.
-- For all other proper nouns, **do not include them in the output** as they should be fully translated into natural English in the main translation process.
+**Strict Rules for Extraction and Translation:**
+1. Extract the **exact and complete text** of the entity as it appears in the input text (e.g., full first and last name).
+2. Provide the absolute best {target_lang} equivalent. Focus on standard transliteration/pronunciation ONLY if changing alphabets (e.g., Korean to English).
+3. {shared_alphabet_rule}
+4. {jpn_instruction}
+5. For ORGANIZATION names, use the official {target_lang} name if widely known, otherwise provide a natural translation. Do not truncate or arbitrarily shorten organization names.
+6. **Exclude** common words, generic nouns, or locations unless part of a specific organization name.
 
 **Output Format:**
-- Return a **JSON list** of objects.
-- Each object must have the following two keys:
-  - `"entity"` (string): The exact text of the entity found in the input text.
-  - `"type"` (string): Must be one of the following exact strings: `"PERSON"` or `"ORGANIZATION"`.
-- Output **ONLY valid JSON**. Do NOT include any explanations, descriptions, introductory phrases, or extra text before or after the JSON code block.
-- Ensure the JSON is correctly formatted.
-- If no entities matching the criteria are found, return an empty JSON list `[]`.
+Return a **JSON list** of objects. Each object must have these exactly three keys:
+- `"entity"` (string): The exact original text found in the source.
+- `"type"` (string): Must be exactly `"PERSON"` or `"ORGANIZATION"`.
+- `"translation"` (string): The translated, transliterated, or preserved equivalent in {target_lang}.
 
 **TEXT:**
 {text}
 """
-
-def create_equivalent_translation_prompt(entity: str, entity_type: str, source_lang: str, target_lang: str, is_japanese_webnovel: bool = False) -> str:
-    """Creates prompt for translating/transliterating a specific named entity."""
-    if is_japanese_webnovel and source_lang.lower() in['chinese', 'zh', 'cn']:
-        instructions = (
-            f"This is a Japanese webnovel translated to Chinese. For PERSON names: "
-            f"Provide the original Japanese reading (romaji) of the name, not the Chinese reading. "
-            f"Example: '日葵' should be 'Himawari' (Japanese) not 'Rìkuí' (Chinese). "
-            f"For ORGANIZATION names: Use the original Japanese name if known, "
-            f"otherwise provide a natural transliteration."
-        )
-    elif entity_type == "PERSON":
-        instructions = (
-            f"For PERSON names: Provide the standard transliteration or most common recognized {target_lang} equivalent. "
-            f"Focus on matching {target_lang} pronunciation conventions. Do NOT translate the literal meaning of the name."
-        )
-    elif entity_type == "ORGANIZATION":
-        instructions = (
-            f"For ORGANIZATION names: Provide the official or most commonly recognized {target_lang} name if it is widely known. "
-            f"If no standard name exists, provide a natural-sounding transliteration or an appropriate, contextually relevant translation."
-        )
-    else:
-        instructions = "Provide the most appropriate equivalent in the target language."
-
-    return f"""Provide the best equivalent in {target_lang} for the following {source_lang} named entity.
-**ENTITY:** '{entity}'
-**TYPE:** {entity_type}
-**Source Language:** {source_lang}
-**Target Language:** {target_lang}
-
-**Strict Rules for Output:**
-1. {instructions}
-2. Return **ONLY** the translated, transliterated, or equivalent entity text.
-3. If the entity should remain unchanged in {target_lang}, return the original entity text **EXACTLY as provided**.
-4. Ensure the output is plain text.
-
-Equivalent in {target_lang}:"""
 
 def create_translation_prompt(text: str, source_lang: str, target_lang: str, active_placeholders: Dict[str, Tuple[str, str]], is_continuation: bool = False) -> str:
     """Creates optimized translation prompt with comprehensive guidance, strong placeholder protection, and context awareness for novel settings."""

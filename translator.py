@@ -8,7 +8,7 @@ from typing import List, Optional, Tuple, Dict
 from pathlib import Path
 from filelock import FileLock
 from google.api_core import exceptions
-from prompts import create_ner_prompt, create_equivalent_translation_prompt, create_translation_prompt
+from prompts import create_ner_prompt, create_translation_prompt
 from exceptions import ProhibitedContentError
 from glossary import GlossaryManager
 from rate_limiter import ModelLimits, ModelType
@@ -39,7 +39,7 @@ class GeminiTranslator:
         self.stop_event = stop_event
         self.RETRY_ATTEMPTS = 5
         self.MIN_RESPONSE_LENGTH = 5
-        self.BURST_DELAY = 4.0
+        self.BURST_DELAY = 15.0
         self.current_chapter_id = None
         self.chunk_count_in_chapter = 0
         self.checkpoint_dir = Path(checkpoint_dir)
@@ -58,36 +58,49 @@ class GeminiTranslator:
         self.glossary_manager = GlossaryManager(self.GLOSSARY_FILE)
         self.validator = TranslationValidator()
         self.models = {
-                    ModelType.GEMINI_2_5_FLASH: {
-                        'model_name': 'gemini-2.5-flash',
-                        'model_instance': None,
-                        'limits': ModelLimits(tpm=1000000, tpd=1000000, rpd=1500, rpm=15, max_chapters_per_day=312, tokens_per_chapter=3200, max_input_tokens=1000000),
-                        'priority': 1,
-                        'available': True
-                    },
-                    ModelType.GEMINI_2_5_PRO: {
-                        'model_name': 'gemini-2.5-pro',
-                        'model_instance': None,
-                        'limits': ModelLimits(tpm=250000, tpd=1000000, rpd=25, rpm=5, max_chapters_per_day=78, tokens_per_chapter=3200, max_input_tokens=2000000),
-                        'priority': 2,
-                        'available': True
-                    },
-                    ModelType.GEMINI_3_FLASH: {
-                        'model_name': 'gemini-3-flash',
-                        'model_instance': None,
-                        'limits': ModelLimits(tpm=1000000, tpd=1000000, rpd=1500, rpm=15, max_chapters_per_day=312, tokens_per_chapter=3200, max_input_tokens=1000000),
-                        'priority': 3,
-                        'available': True
-                    },
-                    ModelType.GEMINI_3_1_PRO: {
-                        'model_name': 'gemini-3.1-pro',
-                        'model_instance': None,
-                        'limits': ModelLimits(tpm=250000, tpd=1000000, rpd=25, rpm=5, max_chapters_per_day=78, tokens_per_chapter=3200, max_input_tokens=2000000),
-                        'priority': 4,
-                        'available': True
-                    }
-                }
-        
+            ModelType.GEMINI_2_5_FLASH: {
+                'model_name': 'gemini-2.5-flash',
+                'model_instance': None,
+                'limits': ModelLimits(tpm=250000, tpd=1000000, rpd=20, rpm=5, max_chapters_per_day=20, tokens_per_chapter=3200, max_input_tokens=1000000),
+                'priority': 1,
+                'available': True
+            },
+            ModelType.GEMINI_2_5_FLASH_LITE: {
+                'model_name': 'gemini-2.5-flash-lite',
+                'model_instance': None,
+                'limits': ModelLimits(tpm=250000, tpd=1000000, rpd=20, rpm=10, max_chapters_per_day=20, tokens_per_chapter=3200, max_input_tokens=1000000),
+                'priority': 3,
+                'available': True
+            },
+            ModelType.GEMINI_2_5_PRO: {  # Disabled in free tier
+                'model_name': 'gemini-2.5-pro',
+                'model_instance': None,
+                'limits': ModelLimits(tpm=250000, tpd=1000000, rpd=0, rpm=0, max_chapters_per_day=0, tokens_per_chapter=3200, max_input_tokens=2000000),
+                'priority': 5,
+                'available': False
+            },
+            ModelType.GEMINI_3_FLASH: {
+                'model_name': 'gemini-3-flash-preview',
+                'model_instance': None,
+                'limits': ModelLimits(tpm=250000, tpd=1000000, rpd=20, rpm=5, max_chapters_per_day=20, tokens_per_chapter=3200, max_input_tokens=1000000),
+                'priority': 2,
+                'available': True
+            },
+            ModelType.GEMINI_3_1_PRO: {  # Disabled in free tier
+                'model_name': 'gemini-3.1-pro',
+                'model_instance': None,
+                'limits': ModelLimits(tpm=250000, tpd=1000000, rpd=0, rpm=0, max_chapters_per_day=0, tokens_per_chapter=3200, max_input_tokens=2000000),
+                'priority': 6,
+                'available': False
+            },
+            ModelType.GEMINI_3_1_FLASH_LITE: {
+                'model_name': 'gemini-3.1-flash-lite-preview',
+                'model_instance': None,
+                'limits': ModelLimits(tpm=250000, tpd=1000000, rpd=500, rpm=15, max_chapters_per_day=500, tokens_per_chapter=3200, max_input_tokens=1000000),
+                'priority': 4,
+                'available': True
+            },
+        }
         self._initialize_models()
         self._load_history()
         self.model_priority_order = sorted([mt for mt, info in self.models.items() if info.get('model_instance') is not None],
@@ -559,64 +572,51 @@ class GeminiTranslator:
         self.chunk_count_in_chapter = 0
 
     def _identify_and_add_entities(self, text: str, source_lang: str, target_lang: str, is_japanese_webnovel: bool = False) -> None:
-        """
-        Identifies named entities (PERSON, ORGANIZATION) in text and adds their translations/transliterations
-        to the glossary if different from source. Uses an available model, potentially waiting for capacity.
-        """
-        if self.stop_event and self.stop_event.is_set():
-            self.logger.debug("Stop signal received, skipping entity identification.")
-            return
+            """ 
+            Identifies and translates named entities (PERSON, ORGANIZATION) in a single API call.
+            Adds translations to the glossary if different from the source.
+            """
+            if self.stop_event and self.stop_event.is_set():
+                self.logger.debug("Stop signal received, skipping entity identification.")
+                return
 
-        # Skip NER for very short texts or invalid types
-        if not isinstance(text, str) or len(text.strip()) < 20:
-            self.logger.debug("Text too short or invalid type for NER, skipping entity identification.")
-            return
+            # Skip NER for very short texts or invalid types
+            if not isinstance(text, str) or len(text.strip()) < 20:
+                self.logger.debug("Text too short or invalid type for NER, skipping entity identification.")
+                return
 
-        # Estimate tokens for the NER prompt + the text
-        ner_prompt_base = create_ner_prompt("", "") # Estimate prompt overhead
-        estimated_ner_prompt_tokens = self.estimate_tokens(ner_prompt_base) + self.estimate_tokens(text)
+            # Pass target_lang to the new combined prompt
+            ner_prompt = create_ner_prompt(text, source_lang, target_lang, is_japanese_webnovel)
+            estimated_ner_prompt_tokens = self.estimate_tokens(ner_prompt)
 
-        # Acquire a model for the NER request
-        model_info = self._wait_for_available_model(estimated_ner_prompt_tokens)
-        if not model_info:
-            self.logger.warning("No model available (even after waiting) for NER request. Skipping entity identification for this chunk.")
-            return
+            model_info = self._wait_for_available_model(estimated_ner_prompt_tokens)
+            if not model_info:
+                self.logger.warning("No model available for NER request. Skipping.")
+                return
 
-        model_type, model, limits = model_info
-        self.logger.debug(f"Using {model_type.value} for NER.")
+            model_type, model, limits = model_info
 
-        ner_prompt = create_ner_prompt(text, source_lang)
-        ner_response = None
+            ner_response = None
+            for attempt in range(self.RETRY_ATTEMPTS):
+                try:
+                    current_time = time.time()
+                    if current_time - limits.last_reset_time >= 60:
+                        limits.requests_made = 0
+                        limits.tokens_used = 0
+                        limits.last_reset_time = current_time
 
-        # Retry loop for the NER API call
-        for attempt in range(self.RETRY_ATTEMPTS):
-            try:
-                # Check rate limits again before the API call
-                current_time = time.time()
-                if current_time - limits.last_reset_time >= 60:
-                     self.logger.debug(f"Resetting minute limits for {model_type.value} before NER call.")
-                     limits.requests_made = 0
-                     limits.tokens_used = 0
-                     limits.last_reset_time = current_time
+                    if limits.requests_made >= limits.rpm or limits.tokens_used + estimated_ner_prompt_tokens > limits.tpm or limits.daily_requests >= limits.rpd:
+                        wait_result = self._wait_for_available_model(estimated_ner_prompt_tokens)
+                        if wait_result:
+                            model_type, model, limits = wait_result
+                            continue
+                        else:
+                            return
 
-                # Re-evaluate token estimate for the actual prompt if needed
-                estimated_prompt_tokens_actual = self.estimate_tokens(ner_prompt) # Use estimate
+                    if self.stop_event and self.stop_event.is_set():
+                        return None
 
-                if limits.requests_made >= limits.rpm or limits.tokens_used + estimated_prompt_tokens_actual > limits.tpm or limits.daily_requests >= limits.rpd:
-                    self.logger.warning(f"Model {model_type.value} hit rate limit just before NER attempt {attempt+1}. Waiting...")
-                    wait_result = self._wait_for_available_model(estimated_prompt_tokens_actual)
-                    if wait_result:
-                        model_type, model, limits = wait_result # Use the newly acquired model and limits
-                        self.logger.info(f"Resuming NER attempt {attempt+1} with model {model_type.value} after waiting.")
-                        continue # Continue with the API call after waiting
-                    else:
-                        self.logger.error(f"No model available after waiting for NER attempt {attempt+1}. Skipping NER.")
-                        return # Cannot get a model, give up on NER for this chunk
-
-                # Make the API call
-                if self.stop_event and self.stop_event.is_set():
-                    return None
-                response = self.client.models.generate_content(
+                    response = self.client.models.generate_content(
                         model=model,
                         contents=ner_prompt,
                         config={
@@ -624,245 +624,101 @@ class GeminiTranslator:
                             "maxOutputTokens": 8192,
                             "responseMimeType": "application/json",
                             "responseSchema": {
-                                        "type": "ARRAY",
-                                        "items": {
-                                            "type": "OBJECT",
-                                            "properties": {
-                                                "entity": {"type": "STRING"},
-                                                "type": {"type": "STRING"}
-                                            },
-                                            "required": ["entity", "type"]
-                                        }
+                                "type": "ARRAY",
+                                "items": {
+                                    "type": "OBJECT",
+                                    "properties": {
+                                        "entity": {"type": "STRING"},
+                                        "type": {"type": "STRING"},
+                                        "translation": {"type": "STRING"}
                                     },
-                            "safety_settings": [
-                                        {
-                                            "category": HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
-                                            "threshold": HarmBlockThreshold.BLOCK_NONE,
-                                        },
-                                        {
-                                            "category": HarmCategory.HARM_CATEGORY_HATE_SPEECH,
-                                            "threshold": HarmBlockThreshold.BLOCK_NONE,
-                                        },
-                                        {
-                                            "category": HarmCategory.HARM_CATEGORY_HARASSMENT,
-                                            "threshold": HarmBlockThreshold.BLOCK_NONE,
-                                        },
-                                        {
-                                            "category": HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
-                                            "threshold": HarmBlockThreshold.BLOCK_NONE,
-                                        },
-                                    ],
+                                    "required":["entity", "type", "translation"]
+                                }
+                            },
+                            "safety_settings":[
+                                {"category": HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, "threshold": HarmBlockThreshold.BLOCK_NONE},
+                                {"category": HarmCategory.HARM_CATEGORY_HATE_SPEECH, "threshold": HarmBlockThreshold.BLOCK_NONE},
+                                {"category": HarmCategory.HARM_CATEGORY_HARASSMENT, "threshold": HarmBlockThreshold.BLOCK_NONE},
+                                {"category": HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, "threshold": HarmBlockThreshold.BLOCK_NONE},
+                            ],
                         }
                     )
 
-                # Check for block reasons
-                if not response or not response.text:
+                    if not response or not response.text:
                         raise ProhibitedContentError("NER response blocked or empty.")
 
-                ner_response = response # Store the successful response
-                actual_output_tokens = self.estimate_tokens(ner_response.text if ner_response.text else "") # Estimate output tokens
-                limits.tokens_used += estimated_prompt_tokens_actual + actual_output_tokens # Update token usage
-                limits.requests_made += 1 # Update request count
-                limits.daily_requests += 1 # Update daily request count
-                self._save_history() # Save history after successful call
-                time.sleep(self.BURST_DELAY)
-                break # Exit retry loop on success
+                    ner_response = response
+                    
+                    actual_output_tokens = self.estimate_tokens(ner_response.text if ner_response.text else "")
+                    limits.tokens_used += estimated_ner_prompt_tokens + actual_output_tokens
+                    limits.requests_made += 1
+                    limits.daily_requests += 1
+                    self._save_history()
+                    
+                    # delay to prevent 429 quota exhaustion on free tier
+                    time.sleep(self.BURST_DELAY)
+                    break 
 
-            except (exceptions.ResourceExhausted, exceptions.ServiceUnavailable, errors.ClientError) as e:
-                self.logger.warning(f"API rate limit or service error during NER attempt {attempt+1}: {e}")
-                retry_delay = 0
-                if hasattr(e, 'retry_delay') and e.retry_delay is not None:
-                    retry_delay = e.retry_delay.total_seconds()
-                    self.logger.info(f"Waiting for API retry_delay: {retry_delay:.2f} seconds.")
-                    time.sleep(retry_delay + random.uniform(0, 1)) # Add jitter to retry_delay
-                else:
-                    # Implement exponential backoff with jitter
-                    sleep_duration = (2 ** attempt) + random.uniform(0, 1)
-                    self.logger.info(f"No specific retry_delay. Waiting with backoff: {sleep_duration:.2f} seconds.")
-                    self._interruptible_sleep(sleep_duration)
+                except (exceptions.ResourceExhausted, exceptions.ServiceUnavailable, errors.ClientError) as e:
+                    retry_delay = 0
+                    if hasattr(e, 'retry_delay') and e.retry_delay is not None:
+                        retry_delay = e.retry_delay.total_seconds()
+                    else:
+                        try:
+                            match = re.search(r"'retryDelay':\s*'(\d+(?:\.\d+)?)s'", str(e))
+                            if match:
+                                retry_delay = float(match.group(1))
+                        except Exception:
+                            retry_delay = (2 ** attempt)
+                    
+                    self.logger.warning(f"Rate limit hit during NER. Waiting {retry_delay:.2f}s before attempt {attempt + 2}")
+                    time.sleep(retry_delay + random.uniform(0, 1))
+                    
+                except ProhibitedContentError:
+                    ner_response = None 
+                    break 
+                    
+                except Exception as e:
+                    self.logger.warning(f"An error occurred during NER attempt {attempt+1}: {e}", exc_info=True)
+                    if attempt == self.RETRY_ATTEMPTS - 1:
+                        ner_response = None 
+                    else:
+                        sleep_duration = (2 ** attempt) + random.uniform(0, 1)
+                        self._interruptible_sleep(sleep_duration)
 
-            except ProhibitedContentError:
-                 ner_response = None # Mark response as blocked, do not retry
-                 break # Exit retry loop
-
-            except Exception as e:
-                self.logger.warning(f"An error occurred during NER attempt {attempt+1}: {e}", exc_info=True)
-                if attempt == self.RETRY_ATTEMPTS - 1:
-                    self.logger.error(f"NER failed after all retries due to unexpected error. Skipping NER.")
-                    ner_response = None # Mark response as failed
-                else:
-                    # Implement exponential backoff with jitter for other errors
-                    sleep_duration = (2 ** attempt) + random.uniform(0, 1)
-                    self.logger.info(f"Waiting with backoff: {sleep_duration:.2f} seconds.")
-                    self._interruptible_sleep(sleep_duration)
-
-        # Process NER response if successful
-        if ner_response and ner_response.text and ner_response.text.strip():
-            response_text = re.sub(r"```json|```", "", ner_response.text).strip()
-
-            entities = []
-            try:
-                if response_text: # Ensure response text is not empty after cleaning
-                    entities = json.loads(response_text)
+            # Process the single JSON response containing ALL entities and translations
+            if ner_response and ner_response.text and ner_response.text.strip():
+                response_text = re.sub(r"```json|```", "", ner_response.text).strip()
+                try:
+                    entities = json.loads(response_text) if response_text else[]
                     if not isinstance(entities, list):
-                         self.logger.warning(f"NER response was not a JSON list. Response: {response_text[:200]}...")
-                         entities = [] # Reset to empty list if not a list
-                else:
-                    self.logger.debug("NER response text was empty after stripping/cleaning.")
+                        entities =[]
+                except json.JSONDecodeError:
+                    entities =[]
 
-            except json.JSONDecodeError as e:
-                self.logger.warning(f"Failed to parse NER response as JSON: {e}. Response: {response_text[:200]}...")
-                entities = [] # Reset to empty list on JSON error
-            except Exception as e:
-                 self.logger.warning(f"An unexpected error occurred processing NER JSON: {e}. Response: {response_text[:200]}...")
-                 entities = [] # Reset to empty list on other errors
+                for entity_data in entities:
+                    if not isinstance(entity_data, dict):
+                        continue
+                        
+                    entity_text = entity_data.get('entity')
+                    entity_type = entity_data.get('type')
+                    translated_entity = entity_data.get('translation')
 
+                    # Validate the data
+                    if not entity_text or not translated_entity or entity_type not in['PERSON', 'ORGANIZATION']:
+                        continue
 
-            valid_entities = []
-            for entity_data in entities:
-                if isinstance(entity_data, dict) and isinstance(entity_data.get('entity'), str) and entity_data.get('type') in ['PERSON', 'ORGANIZATION']:
-                    valid_entities.append(entity_data)
-                else:
-                    self.logger.warning(f"Skipping invalid entity format or type returned by NER: {entity_data}")
+                    entity_text = entity_text.strip()
+                    translated_entity = translated_entity.strip(' \n\r\t\'"“”')
 
-
-            if not valid_entities:
-                 self.logger.debug("No valid entities found or identified by NER after processing.")
-                 return # No valid entities to process
-
-            self.logger.debug(f"Identified {len(valid_entities)} potential entities for translation.")
-
-            # Translate identified entities and add to glossary
-            for entity in valid_entities:
-                entity_text = entity['entity']
-                entity_type = entity['type']
-
-                # Check if already in glossary
-                if self.glossary_manager.get_target_term(entity_text) is not None:
-                    self.logger.debug(f"Entity '{entity_text}' already in glossary. Skipping translation.")
-                    continue
-
-                translated_entity = self._find_equivalent_translation(
-                    entity_text, entity_type, source_lang, target_lang, model, limits, is_japanese_webnovel=is_japanese_webnovel
-                )
-
-                if (translated_entity and translated_entity.strip() and 
-                    translated_entity.strip().lower() != entity_text.strip().lower() and 
-                    len(translated_entity) < 50 and not translated_entity.startswith("This")):
-                    added = self.glossary_manager.add_entry(entity_text, translated_entity, force_update=False)
-                    if added:
-                        self.logger.info(f"Added NER entity to glossary: '{entity_text}' -> '{translated_entity}' (Type: {entity_type})")
-                elif translated_entity and translated_entity.strip().lower() == entity_text.strip().lower():
-                     self.logger.debug(f"Entity translation was same as source '{entity_text}' (or differed only by case/whitespace), not adding to glossary.")
-                else:
-                    self.logger.warning(f"Entity translation failed or returned empty/whitespace for '{entity_text}'. Not adding to glossary.")
-
-
-        elif ner_response is None:
-             self.logger.error("NER call failed after all retries or was blocked.")
-        else:
-            self.logger.debug("NER response was empty or contained only whitespace.")
-
-    def _find_equivalent_translation(self, entity: str, entity_type: str, source_lang: str, target_lang: str, model: str, limits: ModelLimits, is_japanese_webnovel: bool = False) -> Optional[str]:
-        """
-        Finds translation/transliteration for a specific named entity using the provided model.
-        Updates model usage stats for the passed limits object.
-        This function assumes a model has already been acquired and passed in.
-        """
-        if self.stop_event and self.stop_event.is_set():
-            self.logger.debug(f"Stop signal received, skipping entity translation for '{entity}'.")
-            return entity # Return original entity on stop
-
-        try:
-            prompt = create_equivalent_translation_prompt(entity, entity_type, source_lang, target_lang, is_japanese_webnovel)
-            estimated_prompt_tokens = self.estimate_tokens(prompt)
-
-            if estimated_prompt_tokens > limits.max_input_tokens:
-                 self.logger.warning(f"Entity translation prompt for '{entity}' too long ({estimated_prompt_tokens} tokens) for model max input ({limits.max_input_tokens}). Skipping translation.")
-                 return entity # Return original if prompt is too large
-
-            # Check rate limits before the API call
-            current_time = time.time()
-            if current_time - limits.last_reset_time >= 60:
-                 self.logger.debug(f"Resetting minute limits for {model} before entity translation call.")
-                 limits.requests_made = 0
-                 limits.tokens_used = 0
-                 limits.last_reset_time = current_time
-
-
-            if limits.requests_made >= limits.rpm or limits.tokens_used + estimated_prompt_tokens > limits.tpm or limits.daily_requests >= limits.rpd:
-                self.logger.warning(f"Model {model.model_name} hit rate limit just before translating entity '{entity}'. Skipping translation.")
-                self._save_history() # Save state before returning due to limit
-                return entity # Return original entity if rate limit is hit
-
-
-            if self.stop_event and self.stop_event.is_set():
-                return None
-            response = self.client.models.generate_content(
-                    model=model,
-                    contents=prompt,
-                    config={
-                        "temperature": 0.2,
-                        "maxOutputTokens": 100,
-                        "topP": 0.95,
-                        "safety_settings": [
-                                    {
-                                        "category": HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
-                                        "threshold": HarmBlockThreshold.BLOCK_NONE,
-                                    },
-                                    {
-                                        "category": HarmCategory.HARM_CATEGORY_HATE_SPEECH,
-                                        "threshold": HarmBlockThreshold.BLOCK_NONE,
-                                    },
-                                    {
-                                        "category": HarmCategory.HARM_CATEGORY_HARASSMENT,
-                                        "threshold": HarmBlockThreshold.BLOCK_NONE,
-                                    },
-                                    {
-                                        "category": HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
-                                        "threshold": HarmBlockThreshold.BLOCK_NONE,
-                                    },
-                                ],
-                    }
-                )
-
-            # Update block check:
-            if response.prompt_feedback and response.prompt_feedback.block_reason:
-                self.logger.warning(f"Entity translation prompt for '{entity}' blocked: {response.prompt_feedback.block_reason}. Returning original.")
-                return entity
-
-            translated_entity = response.text.strip() if response.text else ""
-            actual_output_tokens = self.estimate_tokens(response.text if response.text else "") # Estimate output tokens
-
-            # Update model usage stats for this entity translation request
-            limits.tokens_used += estimated_prompt_tokens + actual_output_tokens
-            limits.requests_made += 1
-            limits.daily_requests += 1
-            self._save_history() # Save history after successful entity translation
-            time.sleep(self.BURST_DELAY)
-
-            if not translated_entity:
-                self.logger.warning(f"Empty translation response for entity: '{entity}'. Returning original.")
-                return entity # Return original if translation is empty
-
-            # Basic check for nonsensical output (e.g., just punctuation)
-            if len(translated_entity.strip()) < 2 and re.fullmatch(r'[\W_]+', translated_entity.strip()):
-                self.logger.warning(f"Translation for '{entity}' appears to be only punctuation/symbols: '{translated_entity}'. Returning original.")
-                return entity
-
-            self.logger.debug(f"Translated entity '{entity}' -> '{translated_entity}'")
-            return translated_entity
-
-        except (exceptions.ResourceExhausted, exceptions.ServiceUnavailable) as e:
-            self.logger.warning(f"API rate limit or service error translating entity '{entity}': {e}. Returning original entity.", exc_info=True)
-            self._save_history() # Save state on API error
-            return entity # Return original entity on API error
-
-        except (exceptions.ResourceExhausted, exceptions.ServiceUnavailable, errors.ClientError) as e:
-            self.logger.warning(f"API rate limit or service error translating entity '{entity}': {e}. Returning original entity.", exc_info=True)
-            self._save_history() 
-            return entity
-
+                    # Skip if already in glossary or if the translation is identical to the source
+                    if self.glossary_manager.get_target_term(entity_text) is not None:
+                        continue
+                    
+                    if translated_entity and translated_entity.lower() != entity_text.lower():
+                        self.glossary_manager.add_entry(entity_text, translated_entity, force_update=False)
+                        self.logger.info(f"Added batch NER entity to glossary: '{entity_text}' -> '{translated_entity}'")
+                        
     def _post_process_translation(self, translated_text: str) -> str:
         """Refines translation for common fluency issues."""
         processed_text = translated_text
