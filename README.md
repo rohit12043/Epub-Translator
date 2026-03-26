@@ -1,30 +1,26 @@
-# EPUB Translator
+# EPUB Translator (v3.0 Revamp)
 EPUB Translator is a Python-based application designed to make written content more accessible by translating EPUB-format books between languages utilizing the official Google Gemini API. The application provides a simple graphical user interface (GUI) and a modular backend to handle end-to-end translation of EPUB content while preserving original HTML formatting, document structure, and metadata.
 
-Version 2.0 represents a complete architectural rewrite, transitioning from legacy browser automation to a robust, API-driven backend. Key improvements include multi-model support, dynamic rate limiting, automated Named Entity Recognition (NER), and persistent checkpointing for resumable translation sessions.
+**Version 3.0** represents a significant revamp, introducing **Adaptive Scheduling**, **HTML Tag Preservation**, and **Batched NER** for a more robust, high-quality translation experience.
 
 ## Workflow
 <img width="778" height="408" alt="image" src="https://github.com/user-attachments/assets/d8f0ee54-8d38-42ec-912c-12f3b28fb02c" />
 
 The following translation loop defines the core logic of the application:
-1. **Parse:** The app extracts text from XHTML files.
-2. **Analyze:** The NER engine builds a translation map for proper nouns.
-3. **Process:** The engine chunks text based on API token limits.
-4. **Translate:** Chunks are sent to Gemini, with automatic fallback for rate limits.
-5. **Compile:** Translated text is mapped back to original HTML and saved to the final EPUB.
-
-### Frontend
-<img width="500" alt="image" src="https://github.com/user-attachments/assets/64554b16-0052-4d7f-a854-add0a4fc33e9" />
-
-**GUI:** Built with Tkinter, the interface operates asynchronously from the translation engine using isolated multiprocessing. This ensures the UI remains fully responsive while the backend handles heavy API requests, rate limit cooldowns, and chunking.
+1. **Parse:** The app extracts text from XHTML files using `ebooklib` and `BeautifulSoup`.
+2. **Analyze:** The **Batched NER engine** identifies proper nouns (characters, organizations) in a single pass to build a consistent glossary.
+3. **Preserve:** The **TagPreserver** replaces inline HTML tags (em, strong, ruby, etc.) with tokens (`[T0]`, `[T1]`) to protect them during translation.
+4. **Translate:** Chunks are sent to the best available Gemini model via the **Adaptive Scheduler**, which manages rate limits (RPM, TPM, RPD) dynamically.
+5. **Restore & Compile:** Tokens are swapped back to their original tags, and the translated content is repacked into a new EPUB.
 
 ## Core Features
 
-* **Format Preservation:** Translates textual content while maintaining EPUB styling, tags, and structure via `BeautifulSoup` and a custom DOM reconstruction algorithm.
-* **Multi-Model Fallback:** Interfaces with multiple Gemini models (e.g., `gemini-2.5-flash` for speed, `gemini-3.1-pro` for quality), automatically falling back to alternatives if rate limits are reached.
-* **Automated NER:** Performs an initial AI pass to identify and translate proper nouns. These are stored in a local JSON cache and replaced with placeholders during the main translation pass to enforce consistency automatically.
-* **Persistent Checkpointing:** Saves translation state at the HTML chunk level to a local JSON file, allowing sessions to be interrupted and resumed without data loss.
-* **Intelligent Chunking:** Splits text at safe boundaries using mathematical token estimation to strictly adhere to API input limits and preserve narrative coherence.
+* **HTML Tag Preservation (TagPreserver):** Guarantees that inline formatting (like *italics*, **bold**, `<ruby>` tags, and custom `<span>` styles) survives translation perfectly by shielding them from the LLM using a tokenization-restoration system.
+* **Adaptive Scheduling & Multi-Model Fallback:** Dynamically prioritizes models (e.g., `gemini-2.0-flash`, `gemini-1.5-pro`) based on real-time capacity. Automatically handles rate-limit cooldowns and waits for availability.
+* **Batched Named Entity Recognition (NER):** Performs an efficient initial AI pass to identify proper nouns, ensuring consistent character names and terminology throughout the book via a local JSON glossary.
+* **Intelligent Text Chunking:** Splits text at natural boundaries (paragraphs, sentences) using mathematical token estimation to stay within API limits while maintaining narrative context.
+* **Persistent Checkpointing:** Saves progress at the chunk level in `checkpoints/`, allowing you to resume interrupted translations exactly where they left off.
+* **Advanced Error Handling:** Implements exponential backoff and adaptive delays to gracefully handle API congestion and transient errors.
 
 ## Supported Languages
 The application currently supports translation between the following languages:
@@ -37,7 +33,7 @@ The application currently supports translation between the following languages:
 * French
 * German
 
-*Note: The translation prompts in `prompts.py` are currently optimized for narrative coherence in light novel and web novel formats, but can be modified for general use or other language pairs.*
+*Note: The translation prompts in `prompts.py` are currently optimized for narrative coherence in light novel and web novel formats.*
 
 ## Requirements
 ### System Requirements
@@ -68,7 +64,6 @@ git clone https://github.com/rohit12043/epub-translator.git
 cd epub-translator
 ```
 
-
 2. **Install Dependencies**
 ```bash
 python -m venv venv
@@ -77,12 +72,10 @@ python -m venv venv
 pip install -r requirements.txt
 ```
 
-
 3. **Configure API Key**
 * Go to [Google AI Studio](https://aistudio.google.com/) and sign in.
 * Generate a Gemini API key.
 * Create a `.env` file in the project root directory and add the key:
-
 
 ```text
 API_KEY=your_api_key_here
@@ -102,11 +95,11 @@ python main.py
 3. **Language Selection:** Define the source language and the desired target language.
 4. **API Key:** The application automatically loads the key from the `.env` file or direct input.
 5. **Advanced Configurations:**
-* **Japanese Webnovel Toggle:** Enables a specialized NER mode to prioritize Japanese Romaji transliteration over Chinese Pinyin when translating from Chinese-translated Japanese sources.
-6. **Execution:** Click "Start Translation" to begin. Use the "Stop" or "Pause" buttons to safely halt the process and create a checkpoint.
+* **Japanese Webnovel Toggle:** Enables a specialized NER mode to prioritize Japanese Romaji transliteration over Chinese Pinyin.
+6. **Execution:** Click "Start Translation". Progress is saved automatically to `checkpoints/`.
 
 ## Logging and Debugging
-All application actions, rate limit adjustments, errors, and validation flags are written to `logs/translator.log`. Review this file for auditing purposes or to troubleshoot prolonged pauses caused by API rate limits.
+All application actions, rate limit adjustments, errors, and validation flags are written to `logs/translator.log`. Detailed model usage and glossary data are maintained in the `checkpoints/` directory.
 
 ## Contributing
 Contributions to improve the application are welcome. To contribute:
@@ -118,6 +111,6 @@ Contributions to improve the application are welcome. To contribute:
 5. Open a Pull Request with a detailed description of the changes.
 
 ## Disclaimer
-This project is in a very early stage and is a personal/hobby project. It's been tested on a few books, but may still contain bugs or rough edges. While most common use cases should work fine, unexpected issues might come up depending on the structure of your EPUB or how the Gemini API behaves.
+This project is in an early stage and is a personal/hobby project. While it handles most common EPUB structures, unexpected issues might occur depending on the complexity of your EPUB's formatting or Gemini API behavior.
 
-There’s no fixed roadmap or guaranteed updates. I may continue to improve it when I get time, or leave it as-is. If you find bugs or want to suggest improvements, feel free to open an issue or fork the project.
+There’s no fixed roadmap or guaranteed updates. If you find bugs or want to suggest improvements, feel free to open an issue or fork the project.
