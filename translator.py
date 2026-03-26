@@ -1,3 +1,4 @@
+import hashlib
 import logging
 import re
 import time
@@ -12,18 +13,24 @@ from prompts import create_ner_prompt, create_translation_prompt
 from exceptions import ProhibitedContentError
 from glossary import GlossaryManager
 from rate_limiter import ModelLimits, ModelType
+from scheduler import AdaptiveTranslationScheduler
 from text_utils import extract_whitespace_info, reconstruct_whitespace
 from validator import TranslationValidator
 from google import genai
 from google.genai.types import HarmCategory, HarmBlockThreshold
 from google.genai import errors
 
+
 class GeminiTranslator:
     HISTORY_FILENAME = "translation_history.json"
-    LOCK_FILENAME = "translation_history.json.lock"
+    LOCK_FILENAME    = "translation_history.json.lock"
     GLOSSARY_FILENAME = "glossary.json"
 
-    def __init__(self, api_key: str, max_translations_per_session: int = 2000, checkpoint_dir: str = "checkpoints", stop_event=None):
+    # Save history every N successful requests
+    _HISTORY_SAVE_INTERVAL = 5
+
+    def __init__(self, api_key: str, max_translations_per_session: int = 2000,
+                 checkpoint_dir: str = "checkpoints", stop_event=None):
         self.logger = logging.getLogger(__name__)
         if not api_key:
             raise ValueError("API key must be provided.")
@@ -31,83 +38,94 @@ class GeminiTranslator:
             self.client = genai.Client(api_key=api_key)
             self.logger.info("Google Generative AI Client configured successfully.")
         except Exception as e:
-            self.logger.error(f"Failed to configure Google Generative AI Client with provided API key: {e}")
+            self.logger.error(f"Failed to configure Generative AI Client: {e}")
             raise
 
+        self.chapter_ner_cache: Dict[str, List[dict]] = {}
         self.max_translations_per_session = max_translations_per_session
         self.translation_count = 0
+        self.scheduler = AdaptiveTranslationScheduler(self)
         self.stop_event = stop_event
         self.RETRY_ATTEMPTS = 5
         self.MIN_RESPONSE_LENGTH = 5
-        self.BURST_DELAY = 15.0
         self.current_chapter_id = None
         self.chunk_count_in_chapter = 0
+        self._history_save_counter = 0
+
         self.checkpoint_dir = Path(checkpoint_dir)
         try:
             self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-            self.HISTORY_FILE = str(self.checkpoint_dir / self.HISTORY_FILENAME)
-            self.LOCK_FILE = str(self.checkpoint_dir / self.LOCK_FILENAME)
+            self.HISTORY_FILE  = str(self.checkpoint_dir / self.HISTORY_FILENAME)
+            self.LOCK_FILE     = str(self.checkpoint_dir / self.LOCK_FILENAME)
             self.GLOSSARY_FILE = str(self.checkpoint_dir / self.GLOSSARY_FILENAME)
-            self.logger.info(f"Checkpoint directory set to: {self.checkpoint_dir}")
         except Exception as e:
-            self.logger.error(f"Failed to create checkpoint directory {checkpoint_dir}: {e}. Using current directory for files.")
-            self.HISTORY_FILE = self.HISTORY_FILENAME
-            self.LOCK_FILE = self.LOCK_FILENAME
+            self.logger.error(f"Failed to create checkpoint dir: {e}. Using current dir.")
+            self.HISTORY_FILE  = self.HISTORY_FILENAME
+            self.LOCK_FILE     = self.LOCK_FILENAME
             self.GLOSSARY_FILE = self.GLOSSARY_FILENAME
 
         self.glossary_manager = GlossaryManager(self.GLOSSARY_FILE)
         self.validator = TranslationValidator()
-        self.models = {
+        self.active_placeholders: Dict[str, Tuple[str, str]] = {}
+
+        self.models: Dict[ModelType, Dict] = {
             ModelType.GEMINI_2_5_FLASH: {
                 'model_name': 'gemini-2.5-flash',
                 'model_instance': None,
-                'limits': ModelLimits(tpm=250000, tpd=1000000, rpd=20, rpm=5, max_chapters_per_day=20, tokens_per_chapter=3200, max_input_tokens=1000000),
-                'priority': 1,
-                'available': True
+                'limits': ModelLimits(tpm=250000, tpd=1000000, rpd=20, rpm=5,
+                                      max_chapters_per_day=20, tokens_per_chapter=3200,
+                                      max_input_tokens=1000000),
+                'priority': 1, 'available': True,
             },
             ModelType.GEMINI_2_5_FLASH_LITE: {
                 'model_name': 'gemini-2.5-flash-lite',
                 'model_instance': None,
-                'limits': ModelLimits(tpm=250000, tpd=1000000, rpd=20, rpm=10, max_chapters_per_day=20, tokens_per_chapter=3200, max_input_tokens=1000000),
-                'priority': 3,
-                'available': True
+                'limits': ModelLimits(tpm=250000, tpd=1000000, rpd=20, rpm=10,
+                                      max_chapters_per_day=20, tokens_per_chapter=3200,
+                                      max_input_tokens=1000000),
+                'priority': 3, 'available': True,
             },
-            ModelType.GEMINI_2_5_PRO: {  # Disabled in free tier
+            ModelType.GEMINI_2_5_PRO: {
                 'model_name': 'gemini-2.5-pro',
                 'model_instance': None,
-                'limits': ModelLimits(tpm=250000, tpd=1000000, rpd=0, rpm=0, max_chapters_per_day=0, tokens_per_chapter=3200, max_input_tokens=2000000),
-                'priority': 5,
-                'available': False
+                'limits': ModelLimits(tpm=250000, tpd=1000000, rpd=0, rpm=0,
+                                      max_chapters_per_day=0, tokens_per_chapter=3200,
+                                      max_input_tokens=2000000),
+                'priority': 5, 'available': False,
             },
             ModelType.GEMINI_3_FLASH: {
                 'model_name': 'gemini-3-flash-preview',
                 'model_instance': None,
-                'limits': ModelLimits(tpm=250000, tpd=1000000, rpd=20, rpm=5, max_chapters_per_day=20, tokens_per_chapter=3200, max_input_tokens=1000000),
-                'priority': 2,
-                'available': True
+                'limits': ModelLimits(tpm=250000, tpd=1000000, rpd=20, rpm=5,
+                                      max_chapters_per_day=20, tokens_per_chapter=3200,
+                                      max_input_tokens=1000000),
+                'priority': 2, 'available': True,
             },
-            ModelType.GEMINI_3_1_PRO: {  # Disabled in free tier
+            ModelType.GEMINI_3_1_PRO: {
                 'model_name': 'gemini-3.1-pro',
                 'model_instance': None,
-                'limits': ModelLimits(tpm=250000, tpd=1000000, rpd=0, rpm=0, max_chapters_per_day=0, tokens_per_chapter=3200, max_input_tokens=2000000),
-                'priority': 6,
-                'available': False
+                'limits': ModelLimits(tpm=250000, tpd=1000000, rpd=0, rpm=0,
+                                      max_chapters_per_day=0, tokens_per_chapter=3200,
+                                      max_input_tokens=2000000),
+                'priority': 6, 'available': False,
             },
             ModelType.GEMINI_3_1_FLASH_LITE: {
                 'model_name': 'gemini-3.1-flash-lite-preview',
                 'model_instance': None,
-                'limits': ModelLimits(tpm=250000, tpd=1000000, rpd=500, rpm=15, max_chapters_per_day=500, tokens_per_chapter=3200, max_input_tokens=1000000),
-                'priority': 4,
-                'available': True
+                'limits': ModelLimits(tpm=250000, tpd=1000000, rpd=500, rpm=15,
+                                      max_chapters_per_day=500, tokens_per_chapter=3200,
+                                      max_input_tokens=1000000),
+                'priority': 4, 'available': True,
             },
         }
         self._initialize_models()
         self._load_history()
-        self.model_priority_order = sorted([mt for mt, info in self.models.items() if info.get('model_instance') is not None],
-                                        key=lambda x: self.models[x]['priority'])
+        self.model_priority_order = sorted(
+            [mt for mt, info in self.models.items() if info.get('model_instance') is not None],
+            key=lambda x: self.models[x]['priority'],
+        )
         if not self.model_priority_order:
-            self.logger.error("No model instances were successfully initialized. Translation will not be possible.")
-        self.active_placeholders: Dict[str, Tuple[str, str]] = {}
+            self.logger.error("No model instances initialised. Translation will not be possible.")
 
     def _interruptible_sleep(self, seconds: float):
         end_time = time.time() + seconds
@@ -115,960 +133,729 @@ class GeminiTranslator:
             if self.stop_event and self.stop_event.is_set():
                 return
             time.sleep(0.2)
-            
+
+    @staticmethod
+    def _min_request_interval(limits: ModelLimits) -> float:
+        """
+        Minimum seconds between requests to stay within RPM.
+        Uses 95 % of the theoretical interval as a small safety buffer.
+        """
+        if limits.rpm <= 0:
+            return 1.0
+        return max(1.0, (60.0 / limits.rpm) * 0.95)
+
+    def _maybe_save_history(self, force: bool = False):
+        """Save history periodically."""
+        self._history_save_counter += 1
+        if force or self._history_save_counter >= self._HISTORY_SAVE_INTERVAL:
+            self._save_history()
+            self._history_save_counter = 0
+
     def _initialize_models(self):
-        """Initializes model configurations for configured models."""
         for model_type, model_info in self.models.items():
             model_name = model_info.get('model_name')
             if not model_name:
-                self.logger.error(f"Model configuration for {model_type.value} is missing 'model_name'. Skipping initialization.")
                 model_info['available'] = False
                 continue
             try:
                 model_info['model_instance'] = model_name
-                self.logger.info(f"Successfully configured model reference for {model_name}")
                 model_info['available'] = True
+                self.logger.info(f"Configured model reference: {model_name}")
             except Exception as e:
-                self.logger.error(f"Failed to configure model reference for {model_name}: {e}. Marking as unavailable.")
+                self.logger.error(f"Failed to configure {model_name}: {e}")
                 model_info['available'] = False
 
     def _load_history(self):
-        """Loads translation history including model usage statistics."""
         try:
             if os.path.exists(self.HISTORY_FILE):
                 with FileLock(self.LOCK_FILE, timeout=15):
                     with open(self.HISTORY_FILE, 'r', encoding='utf-8') as f:
                         history = json.load(f)
-
                 for model_type_str, model_data in history.items():
                     try:
                         model_type = ModelType(model_type_str)
                         if model_type in self.models:
                             if 'limits' in model_data:
-                                # Load limits from history, potentially overriding defaults
-                                self.models[model_type]['limits'] = ModelLimits.from_dict(model_data['limits'])
-                                limits = self.models[model_type]['limits']
-                                self.logger.info(
-                                    f"Loaded history for {model_type.value}: "
-                                    f"requests_made={limits.requests_made}, "
-                                    f"tokens_used={limits.tokens_used}, "
-                                    f"daily_requests={limits.daily_requests}, "
-                                    f"last_reset_time={time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(limits.last_reset_time))}, "
-                                    f"last_daily_reset={time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(limits.last_daily_reset))}"
+                                self.models[model_type]['limits'] = ModelLimits.from_dict(
+                                    model_data['limits']
                                 )
-                            else:
-                                self.logger.warning(f"History for {model_type.value} is missing 'limits' data. Using default limits for this model.")
-
-                            # Also load availability and priority from history if present
                             if 'available' in model_data:
                                 self.models[model_type]['available'] = model_data['available']
                             if 'priority' in model_data:
                                 self.models[model_type]['priority'] = model_data['priority']
-
-                        else:
-                            self.logger.warning(f"Unknown model type '{model_type_str}' found in history. Skipping.")
-                    except ValueError:
-                        self.logger.warning(f"Invalid model type string '{model_type_str}' in history. Skipping.")
-                    except Exception as e:
-                         self.logger.error(f"Error processing history data for model {model_type_str}: {e}. Skipping this model's history.")
-
-
-                self.logger.info("History loading complete.")
+                    except (ValueError, Exception) as e:
+                        self.logger.warning(f"Error loading history for {model_type_str}: {e}")
+                self.logger.info("History loaded.")
             else:
-                self.logger.info(f"No history file found at {self.HISTORY_FILE}, starting with fresh metrics.")
-                self._save_history() # Save initial state with defaults
-
+                self.logger.info("No history file — starting fresh.")
+                self._save_history()
         except FileLock.Timeout:
-            self.logger.error(f"Timeout acquiring lock for history file {self.LOCK_FILE}. History may not be loaded correctly. Proceeding with potentially stale or default data.")
-        except json.JSONDecodeError as e:
-            self.logger.error(f"Failed to decode history JSON from {self.HISTORY_FILE}: {e}. Initializing with defaults.")
-        except Exception as e:
-            self.logger.error(f"An unexpected error occurred while loading history from {self.HISTORY_FILE}: {e}. Initializing with defaults.")
+            self.logger.error("Timeout acquiring lock for history file.")
+        except (json.JSONDecodeError, Exception) as e:
+            self.logger.error(f"Failed to load history: {e}. Using defaults.")
 
     def _save_history(self):
-        """Saves translation history including detailed model states."""
         try:
             history = {}
             for model_type, model_info in self.models.items():
                 history[model_type.value] = {
                     'limits': model_info['limits'].to_dict(),
                     'available': model_info.get('available', True),
-                    'priority': model_info.get('priority', model_type.value) # Save priority
+                    'priority': model_info.get('priority', model_type.value),
                 }
-
             history_dir = os.path.dirname(self.HISTORY_FILE)
             if history_dir:
                 os.makedirs(history_dir, exist_ok=True)
-
             temp_file = self.HISTORY_FILE + ".tmp"
             with FileLock(self.LOCK_FILE, timeout=15):
                 with open(temp_file, 'w', encoding='utf-8') as f:
                     json.dump(history, f, indent=2, ensure_ascii=False)
                 os.replace(temp_file, self.HISTORY_FILE)
-
-            self.logger.debug(f"Saved detailed translation history to {self.HISTORY_FILE}.")
+            self.logger.debug("History saved.")
         except FileLock.Timeout:
-            self.logger.error(f"Timeout acquiring lock for history file {self.LOCK_FILE}. History may not be saved.")
+            self.logger.error("Timeout acquiring lock when saving history.")
         except Exception as e:
-            self.logger.error(f"Failed to save history to {self.HISTORY_FILE}: {e}.")
+            self.logger.error(f"Failed to save history: {e}")
 
     def _calculate_optimal_model_for_chapters(self, estimated_chapters: int) -> List[ModelType]:
         """
-        Calculates optimal model order based on remaining daily capacity (RPD and max_chapters_per_day limits)
-        and prioritizing models with higher TPM. Resets daily counters if a day has passed.
+        Rank models by remaining daily capacity × TPM / priority.
         """
-        efficiency_scores = []
         current_time = time.time()
-
-        # Perform daily reset for all models before calculating capacity
+        # Perform daily resets before calculating capacity
         for model_info in self.models.values():
             limits = model_info['limits']
             if current_time - limits.last_daily_reset >= 86400:
-                self.logger.info(f"Resetting daily limits for {model_info.get('model_name', 'N/A')}")
+                self.logger.info(f"Daily reset for {model_info.get('model_name', '?')}")
                 limits.daily_requests = 0
                 limits.last_daily_reset = current_time
-        self._save_history() # Save state after potential daily resets
+        self._save_history()
 
+        efficiency_scores: List[Tuple[ModelType, float]] = []
         for model_type, model_info in self.models.items():
-            if not model_info.get('available', True) or model_info.get('model_instance') is None:
-                self.logger.debug(f"Model {model_type.value} is unavailable or not initialized.")
+            if not model_info.get('available', False) or model_info.get('model_instance') is None:
                 continue
-
             limits = model_info['limits']
+            # Remaining capacity by RPD
+            remaining_by_rpd    = max(0, limits.rpd - limits.daily_requests)
+            # Remaining capacity by configured max_chapters_per_day
+            remaining_by_config = max(0, limits.max_chapters_per_day - limits.daily_requests)
+            remaining_daily     = min(remaining_by_rpd, remaining_by_config)
 
-            # Estimate remaining chapters based on RPD and configured max_chapters_per_day
-            remaining_rpd = max(0, limits.rpd - limits.daily_requests)
-            remaining_chapters_by_rpd = max(0, limits.max_chapters_per_day - limits.daily_requests) # Assuming 1 request per chapter
-            remaining_daily_capacity = min(remaining_rpd, remaining_chapters_by_chapers_per_day)
-
-            if remaining_daily_capacity <= 0:
-                self.logger.debug(f"Model {model_type.value} has no remaining daily capacity ({remaining_daily_capacity} est. chapters).")
+            if remaining_daily <= 0:
                 continue
 
-            # Calculate an efficiency score: Remaining Capacity * TPM / Priority (lower priority is better)
-            efficiency = (remaining_daily_capacity * limits.tpm) / (model_info.get('priority', 1) + 0.001) if model_info.get('priority', 1) > 0 else 0
+            priority = model_info.get('priority', 1)
+            efficiency = (remaining_daily * limits.tpm) / max(priority, 0.001)
             efficiency_scores.append((model_type, efficiency))
 
-
-        # Sort models by efficiency score (higher is better)
         efficiency_scores.sort(key=lambda x: x[1], reverse=True)
 
-        self.logger.info(f"Model efficiency ranking for {estimated_chapters} chapters:")
         if not efficiency_scores:
-            self.logger.warning("No models available or with remaining capacity for chapter translation.")
-            self.model_priority_order = [] # Clear priority order if no models are available
+            self.logger.warning("No models with remaining daily capacity.")
+            self.model_priority_order = []
             return []
 
-        ranked_models = [model_type for model_type, _ in efficiency_scores]
-
-        # Log detailed efficiency information
+        ranked = [mt for mt, _ in efficiency_scores]
+        self.logger.info("Model efficiency ranking:")
         for model_type, efficiency in efficiency_scores:
-             limits = self.models[model_type]['limits']
-             remaining_rpd = max(0, limits.rpd - limits.daily_requests)
-             remaining_chapters_by_chapers_per_day = max(0, limits.max_chapters_per_day - limits.daily_requests)
-             remaining_daily_capacity = min(remaining_rpd, remaining_chapters_by_chapers_per_day)
-             self.logger.info(
-                 f" - {model_type.value}: Efficiency: {efficiency:.2f}, "
-                 f"Rem Daily Req: {remaining_rpd}, Rem Config Chapters: {remaining_chapters_by_chapers_per_day}, "
-                 f"Est Rem Daily: {remaining_daily_capacity}"
-             )
+            limits = self.models[model_type]['limits']
+            rem_rpd    = max(0, limits.rpd - limits.daily_requests)
+            rem_config = max(0, limits.max_chapters_per_day - limits.daily_requests)
+            rem_daily  = min(rem_rpd, rem_config)
+            self.logger.info(
+                f"  {model_type.value}: eff={efficiency:.1f}, "
+                f"rem_rpd={rem_rpd}, rem_config_chaps={rem_config}, rem_daily={rem_daily}"
+            )
+        self.model_priority_order = ranked
+        return ranked
 
-        self.model_priority_order = ranked_models # Update the main priority order
-        return self.model_priority_order
-
-    def _get_best_available_model(self, estimated_tokens: int) -> Optional[Tuple[ModelType, str, ModelLimits]]:
-        """
-        Selects the best available model based on current rate limits and priority.
-        Checks minute and daily limits and resets them if their windows have passed.
-        Returns (model_type, model_instance, limits) or None if no model is available.
-        """
+    def _get_best_available_model(self, estimated_tokens: int
+                                   ) -> Optional[Tuple[ModelType, str, ModelLimits]]:
         current_time = time.time()
-
         for model_type in self.model_priority_order:
             model_info = self.models.get(model_type)
             if not model_info:
-                self.logger.debug(f"Model type {model_type.value} in priority order but not in models dictionary.")
                 continue
-
             limits = model_info['limits']
             model_instance = model_info.get('model_instance')
 
-            # Reset minute limits if the window has passed
+            # Reset minute window
             if current_time - limits.last_reset_time >= 60:
-                self.logger.debug(f"Resetting minute limits for {model_type.value}")
                 limits.requests_made = 0
-                limits.tokens_used = 0
+                limits.tokens_used   = 0
                 limits.last_reset_time = current_time
 
-            # Reset daily limits if the window has passed
+            # Reset daily window
             if current_time - limits.last_daily_reset >= 86400:
-                self.logger.info(f"Resetting daily limits for {model_type.value} (fallback reset).")
-                limits.daily_requests = 0
+                limits.daily_requests  = 0
                 limits.last_daily_reset = current_time
 
-            # Check if the model is available and has capacity
-            if (model_info.get('available', True) and
-                model_instance is not None and
-                limits.requests_made < limits.rpm and
-                limits.tokens_used + estimated_tokens <= limits.tpm and
-                limits.daily_requests < limits.rpd and
-                estimated_tokens <= limits.max_input_tokens):
-
-                self.logger.debug(
-                    f"Selected {model_type.value}. "
-                    f"Est Tokens: {estimated_tokens}. "
-                    f"Usage: {limits.requests_made}/{limits.rpm} RPM, "
-                    f"{limits.tokens_used}/{limits.tpm} TPM, "
-                    f"{limits.daily_requests}/{limits.rpd} RPD."
-                )
-                self._save_history() # Save state after selecting a model
+            if (model_info.get('available', False)
+                    and model_instance is not None
+                    and limits.requests_made < limits.rpm
+                    and limits.tokens_used + estimated_tokens <= limits.tpm
+                    and limits.daily_requests < limits.rpd
+                    and estimated_tokens <= limits.max_input_tokens):
                 return model_type, model_instance, limits
-
-            # Log why a model wasn't selected (for debugging)
-            status_parts = []
-            if not model_info.get('available', True):
-                 status_parts.append("not available flag")
-            if model_instance is None:
-                 status_parts.append("not initialized")
-            if limits.requests_made >= limits.rpm:
-                status_parts.append(f"RPM limit ({limits.rpm}) reached")
-            if limits.tokens_used + estimated_tokens > limits.tpm:
-                status_parts.append(f"TPM limit ({limits.tpm}) will be exceeded by {estimated_tokens}")
-            if limits.daily_requests >= limits.rpd:
-                status_parts.append(f"RPD limit ({limits.rpd}) reached")
-            if estimated_tokens > limits.max_input_tokens:
-                status_parts.append(f"chunk ({estimated_tokens}) exceeds max input ({limits.max_input_tokens})")
-
-            if status_parts:
-                 self.logger.debug(f"Model {model_type.value} not selected because: {', '.join(status_parts)}")
-
-
-        self.logger.debug("No available model with sufficient capacity found currently.")
         return None
 
-    def _wait_for_available_model(self, required_tokens: int) -> Optional[Tuple[ModelType, str, ModelLimits]]:
-        """
-        Enhanced model waiting with:
-        - API retry-after header support
-        - Precise rate limit window tracking
-        - Progressive backoff with jitter
-        - Comprehensive status reporting
-        """
-        max_wait_time = 600 # Maximum total wait time in seconds
+    def _wait_for_available_model(self, required_tokens: int
+                                   ) -> Optional[Tuple[ModelType, str, ModelLimits]]:
+        max_wait   = 600
         start_time = time.time()
-        wait_sequence = [5, 10, 20, 40, 60, 90, 120] # Base wait times
-        current_wait_index = 0
-        specific_retry_after = 0 # Time until a specific model suggests retrying
+        wait_seq   = [5, 10, 20, 40, 60, 90, 120]
+        attempt_i  = 0
 
-        while time.time() - start_time < max_wait_time:
+        while time.time() - start_time < max_wait:
             if self.stop_event and self.stop_event.is_set():
-                self.logger.info("Stopped while waiting for model.")
                 return None
-            current_time = time.time()
 
-            # Compare with API-provided retry-after if set
-            if specific_retry_after > current_time:
-                sleep_time = max(1, specific_retry_after - current_time + random.uniform(0, 2)) # Add small jitter
-                self.logger.info(f"Honoring API retry-after: waiting {sleep_time:.1f}s")
-                time.sleep(sleep_time)
-                specific_retry_after = 0 # Reset after waiting
-                continue # Check models again immediately
-
-            best_model = None
-            # Check models in priority order
-            for model_type in self.model_priority_order:
-                model_info = self.models.get(model_type)
-                if not model_info:
-                    continue # Skip if model type is not in config
-
-                limits = model_info['limits']
-                model_instance = model_info.get('model_instance')
-
-                # Reset minute limits if the window has passed
-                if current_time - limits.last_reset_time >= 60:
-                    limits.requests_made = 0
-                    limits.tokens_used = 0
-                    limits.last_reset_time = current_time
-
-                # Reset daily limits if the window has passed
-                if current_time - limits.last_daily_reset >= 86400:
-                    limits.daily_requests = 0
-                    limits.last_daily_reset = current_time
-
-                # Check if the model is available and has capacity for the required tokens
-                if (model_info.get('available', True) and
-                    model_instance is not None and
-                    limits.requests_made < limits.rpm and
-                    limits.tokens_used + required_tokens <= limits.tpm and
-                    limits.daily_requests < limits.rpd and
-                    required_tokens <= limits.max_input_tokens):
-                    best_model = (model_type, model_instance, limits)
-                    break # Found a suitable model, exit loop
-
-            if best_model:
-                model_type, _, limits = best_model
+            best = self._get_best_available_model(required_tokens)
+            if best:
+                mt, _, lim = best
                 self.logger.info(
-                    f"Selected {model_type.value} with capacity: "
-                    f"{limits.rpm-limits.requests_made}RPM, "
-                    f"{limits.tpm-limits.tokens_used}TPM, "
-                    f"{limits.rpd-limits.daily_requests}RPD remaining"
+                    f"Selected {mt.value}: "
+                    f"{lim.rpm - lim.requests_made} RPM / "
+                    f"{lim.rpd - lim.daily_requests} RPD remaining"
                 )
-                return best_model
+                return best
 
-            # No model available, calculate wait time until the earliest minute window reset
-            base_wait = wait_sequence[min(current_wait_index, len(wait_sequence)-1)]
-            time_to_reset = 60 # Assume 60s window
+            # Calculate time until the earliest minute-window reset
+            current_time  = time.time()
+            time_to_reset = 60.0
             for model_info in self.models.values():
-                 if model_info.get('model_instance'): # Only consider models that were initialized
-                     # Time until the minute counter resets for this model
-                     remaining = 60 - (current_time - model_info['limits'].last_reset_time) % 60
-                     time_to_reset = min(time_to_reset, remaining)
+                if model_info.get('model_instance'):
+                    elapsed_in_window = (current_time - model_info['limits'].last_reset_time) % 60
+                    remaining = 60.0 - elapsed_in_window
+                    time_to_reset = min(time_to_reset, remaining)
 
-            # Wait time is the minimum of the base backoff and the time until the earliest minute reset, with jitter
-            sleep_time = min(base_wait, time_to_reset) * (0.9 + 0.2 * random.random()) # Add 10-20% jitter
+            base  = wait_seq[min(attempt_i, len(wait_seq) - 1)]
+            sleep = min(base, time_to_reset) * (0.9 + 0.2 * random.random())
             self.logger.warning(
-                f"No available models (attempt {current_wait_index+1}), "
-                f"waiting {sleep_time:.1f}s. "
-                f"Next window reset in {time_to_reset:.1f}s"
+                f"No model available (attempt {attempt_i + 1}), "
+                f"sleeping {sleep:.1f}s (reset in {time_to_reset:.1f}s)."
             )
-            time.sleep(sleep_time)
-            current_wait_index += 1
+            time.sleep(sleep)
+            attempt_i += 1
+            if attempt_i % 3 == 0:
+                self._save_history()
 
-            # Save history periodically while waiting to persist updated limits
-            if current_wait_index % 3 == 0: # Save history every few attempts
-                 self._save_history()
-
-
-        self.logger.error(
-            f"Failed to acquire model after {max_wait_time}s. "
-            f"Last required tokens: {required_tokens}"
-        )
+        self.logger.error(f"Could not acquire a model after {max_wait}s.")
         return None
 
     def estimate_tokens(self, text: str) -> int:
-        """
-        Estimates tokens using a heuristic (characters / X + buffer).
-        This is a rough estimate and not as accurate as model-specific tokenizers, but useful for chunking
-        and initial limit checks. Character/3 is common for Latin text. For mixed scripts (like CJK + Latin),
-        a higher divisor might be more accurate, but 3 is a generally safe lower bound estimate ensuring we
-        don't underestimate too much. Adding a buffer accounts for prompt structure, few-shot examples, etc.
-        """
-        if not isinstance(text, str):
-            text = ""
-        if not text:
+        if not isinstance(text, str) or not text:
             return 0
-        # Heuristic: Characters / 3 + a buffer for prompt overhead, etc.
-        return max(1, len(text) // 3 + 150) # Ensure minimum of 1 token for non-empty strings
+        return max(1, int(len(text) / 3.5) + 120)
 
     def count_tokens(self, text: str, model: str = None) -> int:
         if model:
             try:
-                response = self.client.models.count_tokens(
-                    model=model,
-                    contents=text
-                )
-                return response.total_tokens
+                resp = self.client.models.count_tokens(model=model, contents=text)
+                return resp.total_tokens
             except Exception as e:
-                self.logger.warning(f"Token count failed: {e}")
-                return self.estimate_tokens(text)
+                self.logger.warning(f"Token count API failed: {e}")
         return self.estimate_tokens(text)
 
     def _split_large_chunk(self, text: str, max_tokens: int) -> List[str]:
-        """Splits text into chunks within token limits, prioritizing paragraph breaks then sentences."""
         if not isinstance(text, str) or not text.strip():
             return []
-        estimated_tokens = self.estimate_tokens(text)
-        if estimated_tokens <= max_tokens:
+        if self.estimate_tokens(text) <= max_tokens:
             return [text]
-        self.logger.info(f"Splitting large chunk: estimated {estimated_tokens} tokens > max {max_tokens} tokens.")
-        chunks = []
-        current_chunk_parts = []
-        current_chunk_tokens = 0
-        safety_buffer = 50
 
-        # Protect ellipses
+        safety = 50
         text = re.sub(r'\.{3,}', '___ELLIPSIS___', text)
-        text = re.sub(r'…', '___ELLIPSIS___', text)
+        text = re.sub(r'…',       '___ELLIPSIS___', text)
 
-        # Split by paragraphs first
+        chunks: List[str] = []
+        current_parts: List[str] = []
+        current_tokens = 0
+
         paragraphs = re.split(r'(\n\s*\n+)', text)
-        paragraph_texts = []
-        for i in range(0, len(paragraphs), 2):
-            para = paragraphs[i]
-            separator = paragraphs[i + 1] if i + 1 < len(paragraphs) else ''
-            paragraph_texts.append((para, separator))
+        para_pairs = [
+            (paragraphs[i], paragraphs[i + 1] if i + 1 < len(paragraphs) else '')
+            for i in range(0, len(paragraphs), 2)
+        ]
 
-        for para, separator in paragraph_texts:
-            para_tokens = self.estimate_tokens(para)
-            separator_tokens = self.estimate_tokens(separator)
-            if current_chunk_tokens > 0 and (current_chunk_tokens + para_tokens + separator_tokens + safety_buffer > max_tokens):
-                chunk_text = ''.join(current_chunk_parts).strip()
-                if chunk_text:
-                    chunk_text = chunk_text.replace('___ELLIPSIS___', '...')
-                    chunks.append(chunk_text)
-                current_chunk_parts = [para + separator]
-                current_chunk_tokens = para_tokens + separator_tokens
+        for para, sep in para_pairs:
+            p_tokens = self.estimate_tokens(para + sep)
+            if current_tokens > 0 and current_tokens + p_tokens + safety > max_tokens:
+                chunk = ''.join(current_parts).strip().replace('___ELLIPSIS___', '...')
+                if chunk:
+                    chunks.append(chunk)
+                current_parts = [para + sep]
+                current_tokens = p_tokens
             else:
-                current_chunk_parts.append(para + separator)
-                current_chunk_tokens += para_tokens + separator_tokens
+                current_parts.append(para + sep)
+                current_tokens += p_tokens
 
-        if current_chunk_parts:
-            chunk_text = ''.join(current_chunk_parts).strip()
-            if chunk_text:
-                chunk_text = chunk_text.replace('___ELLIPSIS___', '...')
-                chunks.append(chunk_text)
+        if current_parts:
+            chunk = ''.join(current_parts).strip().replace('___ELLIPSIS___', '...')
+            if chunk:
+                chunks.append(chunk)
 
-        # Further split chunks by sentences if still too large
-        final_chunks = []
+        # Further split by sentences if any chunk is still too large
+        final: List[str] = []
         for chunk in chunks:
-            chunk_est_tokens = self.estimate_tokens(chunk)
-            if chunk_est_tokens <= max_tokens:
-                final_chunks.append(chunk)
+            if self.estimate_tokens(chunk) <= max_tokens:
+                final.append(chunk)
                 continue
-            self.logger.info(f"Chunk (estimated {chunk_est_tokens} tokens) too large, splitting by sentences.")
-            # Re-protect ellipses
             chunk = re.sub(r'\.{3,}', '___ELLIPSIS___', chunk)
-            chunk = re.sub(r'…', '___ELLIPSIS___', chunk)
-            # Split by sentence-ending punctuation
-            sentence_parts = re.split(r'([.!?。？！]+)', chunk)
-            sentences = []
-            for i in range(0, len(sentence_parts) - 1, 2):
-                sentence = sentence_parts[i] + (sentence_parts[i + 1] if i + 1 < len(sentence_parts) else "")
-                if sentence.strip():
-                    sentences.append(sentence)
-            if len(sentence_parts) % 2 == 1 and sentence_parts[-1].strip():
-                sentences.append(sentence_parts[-1])
+            chunk = re.sub(r'…',       '___ELLIPSIS___', chunk)
+            parts = re.split(r'([.!?。？！]+)', chunk)
+            sents: List[str] = []
+            for i in range(0, len(parts) - 1, 2):
+                s = parts[i] + (parts[i + 1] if i + 1 < len(parts) else '')
+                if s.strip():
+                    sents.append(s)
+            if len(parts) % 2 == 1 and parts[-1].strip():
+                sents.append(parts[-1])
 
-            current_sub_chunk = []
-            sub_chunk_tokens = 0
-            for sentence in sentences:
-                sentence_tokens = self.estimate_tokens(sentence)
-                if sub_chunk_tokens > 0 and (sub_chunk_tokens + sentence_tokens + safety_buffer > max_tokens):
-                    sub_chunk = ''.join(current_sub_chunk).strip()
-                    if sub_chunk:
-                        sub_chunk = sub_chunk.replace('___ELLIPSIS___', '...')
-                        final_chunks.append(sub_chunk)
-                    current_sub_chunk = [sentence]
-                    sub_chunk_tokens = sentence_tokens
+            cur_sub: List[str] = []
+            cur_sub_t = 0
+            for sent in sents:
+                st = self.estimate_tokens(sent)
+                if cur_sub_t > 0 and cur_sub_t + st + safety > max_tokens:
+                    sub = ''.join(cur_sub).strip().replace('___ELLIPSIS___', '...')
+                    if sub:
+                        final.append(sub)
+                    cur_sub   = [sent]
+                    cur_sub_t = st
                 else:
-                    current_sub_chunk.append(sentence)
-                    sub_chunk_tokens += sentence_tokens
+                    cur_sub.append(sent)
+                    cur_sub_t += st
+            if cur_sub:
+                sub = ''.join(cur_sub).strip().replace('___ELLIPSIS___', '...')
+                if sub:
+                    final.append(sub)
 
-            if current_sub_chunk:
-                sub_chunk = ''.join(current_sub_chunk).strip()
-                if sub_chunk:
-                    sub_chunk = sub_chunk.replace('___ELLIPSIS___', '...')
-                    final_chunks.append(sub_chunk)
-
-        # Clean final chunks
-        cleaned_final_chunks = [c.strip() for c in final_chunks if c and c.strip()]
-        self.logger.debug(f"Split into {len(cleaned_final_chunks)} chunks.")
-        return cleaned_final_chunks
-
+        return [c for c in final if c.strip()]
 
     def _reset_chunk_count(self):
-        """Resets chunk count and chapter ID for a new chapter."""
-        self.current_chapter_id = None
+        self.current_chapter_id   = None
         self.chunk_count_in_chapter = 0
 
-    def _identify_and_add_entities(self, text: str, source_lang: str, target_lang: str, is_japanese_webnovel: bool = False) -> None:
-            """ 
-            Identifies and translates named entities (PERSON, ORGANIZATION) in a single API call.
-            Adds translations to the glossary if different from the source.
-            """
-            if self.stop_event and self.stop_event.is_set():
-                self.logger.debug("Stop signal received, skipping entity identification.")
-                return
+    def _identify_and_add_entities(self, text: str, source_lang: str, target_lang: str,
+                                    is_japanese_webnovel: bool = False) -> None:
+        if self.stop_event and self.stop_event.is_set():
+            return
+        if not isinstance(text, str) or len(text.strip()) < 50:
+            return
 
-            # Skip NER for very short texts or invalid types
-            if not isinstance(text, str) or len(text.strip()) < 20:
-                self.logger.debug("Text too short or invalid type for NER, skipping entity identification.")
-                return
+        chapter_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        if chapter_hash in getattr(self, "chapter_ner_cache", {}):
+            entities = self.chapter_ner_cache[chapter_hash]
+        else:
+            ner_prompt      = create_ner_prompt(text, source_lang, target_lang, is_japanese_webnovel)
+            est_tokens      = self.estimate_tokens(ner_prompt)
+            scheduler       = getattr(self, "scheduler", None)
+            if scheduler:
+                model_info = scheduler.schedule(ner_prompt, est_tokens)
+                if not model_info:
+                    model_info = self._wait_for_available_model(est_tokens)
+            else:
+                model_info = self._wait_for_available_model(est_tokens)
 
-            # Pass target_lang to the new combined prompt
-            ner_prompt = create_ner_prompt(text, source_lang, target_lang, is_japanese_webnovel)
-            estimated_ner_prompt_tokens = self.estimate_tokens(ner_prompt)
-
-            model_info = self._wait_for_available_model(estimated_ner_prompt_tokens)
             if not model_info:
-                self.logger.warning("No model available for NER request. Skipping.")
+                self.logger.warning("No model available for NER. Skipping.")
                 return
 
-            model_type, model, limits = model_info
+            _, model, limits = model_info
+            entities: List[dict] = []
 
-            ner_response = None
             for attempt in range(self.RETRY_ATTEMPTS):
+                if self.stop_event and self.stop_event.is_set():
+                    return
                 try:
                     current_time = time.time()
                     if current_time - limits.last_reset_time >= 60:
                         limits.requests_made = 0
-                        limits.tokens_used = 0
+                        limits.tokens_used   = 0
                         limits.last_reset_time = current_time
-
-                    if limits.requests_made >= limits.rpm or limits.tokens_used + estimated_ner_prompt_tokens > limits.tpm or limits.daily_requests >= limits.rpd:
-                        wait_result = self._wait_for_available_model(estimated_ner_prompt_tokens)
+                    if (limits.requests_made >= limits.rpm
+                            or limits.tokens_used + est_tokens > limits.tpm
+                            or limits.daily_requests >= limits.rpd):
+                        wait_result = self._wait_for_available_model(est_tokens)
                         if wait_result:
-                            model_type, model, limits = wait_result
-                            continue
-                        else:
-                            return
-
-                    if self.stop_event and self.stop_event.is_set():
-                        return None
+                            _, model, limits = wait_result
+                        continue
 
                     response = self.client.models.generate_content(
                         model=model,
                         contents=ner_prompt,
                         config={
                             "temperature": 0.1,
-                            "maxOutputTokens": 8192,
-                            "responseMimeType": "application/json",
-                            "responseSchema": {
+                            "max_output_tokens": 8192,
+                            "response_mime_type": "application/json",
+                            "response_schema": {
                                 "type": "ARRAY",
                                 "items": {
                                     "type": "OBJECT",
                                     "properties": {
-                                        "entity": {"type": "STRING"},
-                                        "type": {"type": "STRING"},
-                                        "translation": {"type": "STRING"}
+                                        "entity":      {"type": "STRING"},
+                                        "type":        {"type": "STRING"},
+                                        "translation": {"type": "STRING"},
                                     },
-                                    "required":["entity", "type", "translation"]
-                                }
+                                    "required": ["entity", "type", "translation"],
+                                },
                             },
-                            "safety_settings":[
-                                {"category": HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, "threshold": HarmBlockThreshold.BLOCK_NONE},
-                                {"category": HarmCategory.HARM_CATEGORY_HATE_SPEECH, "threshold": HarmBlockThreshold.BLOCK_NONE},
-                                {"category": HarmCategory.HARM_CATEGORY_HARASSMENT, "threshold": HarmBlockThreshold.BLOCK_NONE},
-                                {"category": HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, "threshold": HarmBlockThreshold.BLOCK_NONE},
+                            "safety_settings": [
+                                {"category": HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+                                 "threshold": HarmBlockThreshold.BLOCK_NONE},
+                                {"category": HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+                                 "threshold": HarmBlockThreshold.BLOCK_NONE},
+                                {"category": HarmCategory.HARM_CATEGORY_HARASSMENT,
+                                 "threshold": HarmBlockThreshold.BLOCK_NONE},
+                                {"category": HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+                                 "threshold": HarmBlockThreshold.BLOCK_NONE},
                             ],
-                        }
+                        },
                     )
 
                     if not response or not response.text:
                         raise ProhibitedContentError("NER response blocked or empty.")
 
-                    ner_response = response
-                    
-                    actual_output_tokens = self.estimate_tokens(ner_response.text if ner_response.text else "")
-                    limits.tokens_used += estimated_ner_prompt_tokens + actual_output_tokens
+                    actual_out = self.estimate_tokens(response.text or "")
+                    limits.tokens_used   += est_tokens + actual_out
                     limits.requests_made += 1
                     limits.daily_requests += 1
-                    self._save_history()
-                    
-                    # delay to prevent 429 quota exhaustion on free tier
-                    time.sleep(self.BURST_DELAY)
-                    break 
+                    self._maybe_save_history()
 
-                except (exceptions.ResourceExhausted, exceptions.ServiceUnavailable, errors.ClientError) as e:
-                    retry_delay = 0
-                    if hasattr(e, 'retry_delay') and e.retry_delay is not None:
-                        retry_delay = e.retry_delay.total_seconds()
-                    else:
-                        try:
-                            match = re.search(r"'retryDelay':\s*'(\d+(?:\.\d+)?)s'", str(e))
-                            if match:
-                                retry_delay = float(match.group(1))
-                        except Exception:
-                            retry_delay = (2 ** attempt)
-                    
-                    self.logger.warning(f"Rate limit hit during NER. Waiting {retry_delay:.2f}s before attempt {attempt + 2}")
-                    time.sleep(retry_delay + random.uniform(0, 1))
-                    
+                    resp_text = re.sub(r"```json|```", "", response.text).strip()
+                    try:
+                        entities = json.loads(resp_text) if resp_text else []
+                        if not isinstance(entities, list):
+                            entities = []
+                    except json.JSONDecodeError:
+                        entities = []
+
+                    # Adaptive delay based on model RPM
+                    delay = self._min_request_interval(limits)
+                    time.sleep(delay)
+                    break
+
+                except (exceptions.ResourceExhausted, exceptions.ServiceUnavailable,
+                        errors.ClientError) as e:
+                    retry_delay = self._extract_retry_delay(e, attempt)
+                    self.logger.warning(f"Rate limit (NER): waiting {retry_delay:.1f}s")
+                    self._interruptible_sleep(retry_delay + random.uniform(0, 1))
                 except ProhibitedContentError:
-                    ner_response = None 
-                    break 
-                    
+                    self.logger.warning("NER blocked by safety filters.")
+                    break
                 except Exception as e:
-                    self.logger.warning(f"An error occurred during NER attempt {attempt+1}: {e}", exc_info=True)
+                    self.logger.warning(f"NER attempt {attempt + 1} failed: {e}")
                     if attempt == self.RETRY_ATTEMPTS - 1:
-                        ner_response = None 
-                    else:
-                        sleep_duration = (2 ** attempt) + random.uniform(0, 1)
-                        self._interruptible_sleep(sleep_duration)
+                        break
+                    self._interruptible_sleep((2 ** attempt) + random.uniform(0, 1))
 
-            # Process the single JSON response containing ALL entities and translations
-            if ner_response and ner_response.text and ner_response.text.strip():
-                response_text = re.sub(r"```json|```", "", ner_response.text).strip()
-                try:
-                    entities = json.loads(response_text) if response_text else[]
-                    if not isinstance(entities, list):
-                        entities =[]
-                except json.JSONDecodeError:
-                    entities =[]
+            self.chapter_ner_cache[chapter_hash] = entities
 
-                for entity_data in entities:
-                    if not isinstance(entity_data, dict):
-                        continue
-                        
-                    entity_text = entity_data.get('entity')
-                    entity_type = entity_data.get('type')
-                    translated_entity = entity_data.get('translation')
+        for entity_data in entities:
+            if not isinstance(entity_data, dict):
+                continue
+            entity_text       = entity_data.get("entity", "").strip()
+            translated_entity = entity_data.get("translation", "").strip(' \n\r\t\'""\u201c\u201d')
+            entity_type       = entity_data.get("type", "")
+            if not entity_text or not translated_entity:
+                continue
+            if entity_type not in ("PERSON", "ORGANIZATION"):
+                continue
+            if self.glossary_manager.get_target_term(entity_text):
+                continue
+            if translated_entity.lower() != entity_text.lower():
+                added = self.glossary_manager.add_entry(entity_text, translated_entity, force_update=False)
+                if added:
+                    self.logger.info(f"NER glossary: {entity_text} → {translated_entity}")
 
-                    # Validate the data
-                    if not entity_text or not translated_entity or entity_type not in['PERSON', 'ORGANIZATION']:
-                        continue
+    def _post_process_translation(self, text: str) -> str:
+        if not isinstance(text, str):
+            return text
+        # Fix stutter artefacts (e.g. "a - a")
+        text = re.sub(r'\b([a-zA-Z])- ?\1\b', r'\1', text)
+        # Collapse excess internal whitespace (not at newlines)
+        text = re.sub(r'(?<!\n) {2,}(?!\n)', ' ', text)
+        return text
 
-                    entity_text = entity_text.strip()
-                    translated_entity = translated_entity.strip(' \n\r\t\'"“”')
+    @staticmethod
+    def _extract_retry_delay(exc: Exception, attempt: int) -> float:
+        """Extract retry delay from API error, falling back to exponential backoff."""
+        if hasattr(exc, 'retry_delay') and exc.retry_delay is not None:
+            return exc.retry_delay.total_seconds()
+        try:
+            m = re.search(r"'retryDelay':\s*'(\d+(?:\.\d+)?)s'", str(exc))
+            if m:
+                return float(m.group(1))
+        except Exception:
+            pass
+        return float(2 ** attempt)
 
-                    # Skip if already in glossary or if the translation is identical to the source
-                    if self.glossary_manager.get_target_term(entity_text) is not None:
-                        continue
-                    
-                    if translated_entity and translated_entity.lower() != entity_text.lower():
-                        self.glossary_manager.add_entry(entity_text, translated_entity, force_update=False)
-                        self.logger.info(f"Added batch NER entity to glossary: '{entity_text}' -> '{translated_entity}'")
-                        
-    def _post_process_translation(self, translated_text: str) -> str:
-        """Refines translation for common fluency issues."""
-        processed_text = translated_text
+    def translate_text(self, text: str, source_lang: str, target_lang: str,
+                       is_japanese_webnovel: bool = False,
+                       chapter_id: str = None) -> str:
+        if self.stop_event and self.stop_event.is_set():
+            return text
 
-        if not isinstance(processed_text, str):
-             self.logger.warning(f"Post-processing received non-string input: {type(processed_text)}. Skipping post-processing.")
-             return translated_text
+        original_text = text
+        try:
+            if not isinstance(original_text, str) or not original_text.strip():
+                return original_text
 
-        # Fix common model artifacts like "a -" or "a - a"
-        # This pattern targets single letters followed by optional space and hyphen, then optional space and the same letter.
-        # It might need refinement based on observed model behavior.
-        processed_text = re.sub(r'\b([a-zA-Z])- ?\1\b', r'\1', processed_text)
-        processed_text = re.sub(r'\b([a-zA-Z]) + \1\b', r'\1', processed_text)
+            cleaned_text, whitespace_info = extract_whitespace_info(original_text)
+            if not cleaned_text or len(cleaned_text) < self.MIN_RESPONSE_LENGTH:
+                return reconstruct_whitespace("", whitespace_info)
 
-        # Reduce multiple spaces that are not explicitly intended (e.g., not \n\n)
-        processed_text = re.sub(r'(?<!\s)\s{2,}(?!\s)', ' ', processed_text)
+            # strip [Tn] tokens before NER so they don't confuse the model
+            text_for_ner = re.sub(r'\[T\d+\]', '', cleaned_text).strip()
+            if self.glossary_manager is not None:
+                self._identify_and_add_entities(
+                    text_for_ner, source_lang, target_lang, is_japanese_webnovel
+                )
 
+            if self.glossary_manager is None:
+                processed_text = cleaned_text
+                self.active_placeholders = {}
+            else:
+                processed_text, self.active_placeholders = \
+                    self.glossary_manager.create_placeholders(cleaned_text)
 
-        return processed_text
+            est_total = self.estimate_tokens(processed_text)
+            model_info = self._wait_for_available_model(est_total)
+            if not model_info:
+                self.logger.error("No models available — skipping translation.")
+                return reconstruct_whitespace(cleaned_text, whitespace_info)
 
-    def translate_text(self, text: str, source_lang: str, target_lang: str, is_japanese_webnovel: bool = False, chapter_id: str = None) -> str:
-            if self.stop_event and self.stop_event.is_set():
-                self.logger.info("Translator stopped signal received. Skipping translation.")
-                return text
+            model_type, model, limits = model_info
+            self.logger.info(f"Using {model_type.value} for translation.")
 
-            original_text = text
-            try:
-                if not isinstance(original_text, str) or not original_text.strip():
-                    self.logger.debug("Input text is empty or contains only whitespace or is not a string. Skipping translation.")
-                    return original_text
+            chunks = self._split_large_chunk(processed_text, limits.max_input_tokens)
+            translated_chunks: List[str] = []
 
-                cleaned_text, whitespace_info = extract_whitespace_info(original_text)
-                if not cleaned_text or len(cleaned_text) < self.MIN_RESPONSE_LENGTH:
-                    self.logger.debug(f"Cleaned text too short ({len(cleaned_text)} chars) or empty. Skipping translation.")
-                    return reconstruct_whitespace("", whitespace_info)
-
-                if self.glossary_manager is None:
-                    self.logger.error("GlossaryManager is not initialized. Cannot perform NER.")
-                else:
-                    self._identify_and_add_entities(cleaned_text, source_lang, target_lang, is_japanese_webnovel)
-
-                if self.glossary_manager is None:
-                    self.logger.error("GlossaryManager is not initialized. Cannot create placeholders.")
-                    processed_text_with_placeholders = cleaned_text
-                    self.active_placeholders = {}
-                else:
-                    processed_text_with_placeholders, self.active_placeholders = self.glossary_manager.create_placeholders(cleaned_text)
-
-                estimated_total_tokens = self.estimate_tokens(processed_text_with_placeholders)
-                model_info = self._wait_for_available_model(estimated_total_tokens)
-                if not model_info:
-                    self.logger.error("Translation skipped: No models available after waiting for the main translation request.")
-                    return reconstruct_whitespace(cleaned_text, whitespace_info)
-
-                model_type, model, limits = model_info
-                self.logger.info(f"Using model {model_type.value} for translation.")
-
-                chunks_with_placeholders = self._split_large_chunk(processed_text_with_placeholders, limits.max_input_tokens)
-                translated_chunks =[]
-                
-                if chapter_id != self.current_chapter_id:
-                    self._reset_chunk_count()
+            if chapter_id != self.current_chapter_id:
+                self._reset_chunk_count()
                 self.current_chapter_id = chapter_id
 
-                for i, chunk_with_placeholders in enumerate(chunks_with_placeholders):
+            for i, chunk in enumerate(chunks):
+                if self.stop_event and self.stop_event.is_set():
+                    translated_chunks.extend(chunks[i:])
+                    break
+
+                if (not isinstance(chunk, str) or not chunk.strip()
+                        or len(chunk.strip()) < self.MIN_RESPONSE_LENGTH):
+                    translated_chunks.append(chunk)
+                    continue
+
+                use_continuation = (i > 0 and not (
+                    len(chunks) > 5 and i % 3 == 2
+                ))
+                translated_chunk = chunk  # fallback
+
+                for attempt in range(self.RETRY_ATTEMPTS):
                     if self.stop_event and self.stop_event.is_set():
-                        self.logger.info(f"Stop signal received. Stopping translation after chunk {i}/{len(chunks_with_placeholders)}.")
-                        translated_chunks.extend(chunks_with_placeholders[i:])
                         break
+                    try:
+                        current_time = time.time()
+                        if current_time - limits.last_reset_time >= 60:
+                            limits.requests_made = 0
+                            limits.tokens_used   = 0
+                            limits.last_reset_time = current_time
 
-                    if not isinstance(chunk_with_placeholders, str) or not chunk_with_placeholders.strip() or len(chunk_with_placeholders.strip()) < self.MIN_RESPONSE_LENGTH:
-                        translated_chunks.append(chunk_with_placeholders)
-                        continue
+                        est_chunk = self.estimate_tokens(chunk)
+                        if (limits.requests_made >= limits.rpm
+                                or limits.tokens_used + est_chunk > limits.tpm
+                                or limits.daily_requests >= limits.rpd):
+                            wait_result = self._wait_for_available_model(est_chunk)
+                            if wait_result:
+                                model_type, model, limits = wait_result
+                            continue
 
-                    chunk_translated_successfully = False
-                    translated_chunk_text = chunk_with_placeholders
-                    
-                    use_continuation = False
-                    if i > 0:
-                        if len(chunks_with_placeholders) > 5 and i % 3 == 2:
-                            self.logger.debug(f"Using full prompt for chunk {i+1} (index {i}) in chapter {chapter_id} as it's the {i//3 + 1}th third chunk.")
-                        else:
-                            use_continuation = True
+                        prompt      = create_translation_prompt(
+                            chunk, source_lang, target_lang,
+                            self.active_placeholders,
+                            is_continuation=use_continuation,
+                        )
+                        est_prompt  = self.estimate_tokens(prompt)
 
-                    for attempt in range(self.RETRY_ATTEMPTS):
                         if self.stop_event and self.stop_event.is_set():
+                            return None
+
+                        response = self.client.models.generate_content(
+                            model=model,
+                            contents=prompt,
+                            config={
+                                "temperature": 0.3,
+                                "max_output_tokens": 4096,
+                                "safety_settings": [
+                                    {"category": HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+                                     "threshold": HarmBlockThreshold.BLOCK_NONE},
+                                    {"category": HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+                                     "threshold": HarmBlockThreshold.BLOCK_NONE},
+                                    {"category": HarmCategory.HARM_CATEGORY_HARASSMENT,
+                                     "threshold": HarmBlockThreshold.BLOCK_NONE},
+                                    {"category": HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+                                     "threshold": HarmBlockThreshold.BLOCK_NONE},
+                                ],
+                            },
+                        )
+
+                        if (response.prompt_feedback
+                                and response.prompt_feedback.block_reason):
+                            break  # Use fallback (original chunk)
+
+                        response_text   = response.text if response.text is not None else ""
+                        current_output  = response_text.strip()
+
+                        # Validate glossary placeholder preservation
+                        placeholder_missing = any(
+                            ph in chunk and ph not in current_output
+                            for ph in self.active_placeholders
+                        )
+                        if placeholder_missing:
+                            if attempt == self.RETRY_ATTEMPTS - 1:
+                                break
+                            continue
+
+                        if not current_output or len(current_output) < self.MIN_RESPONSE_LENGTH:
+                            if attempt < self.RETRY_ATTEMPTS - 1:
+                                raise ValueError("Empty/short response.")
                             break
-                        try:
-                            current_time = time.time()
-                            if current_time - limits.last_reset_time >= 60:
-                                limits.requests_made = 0
-                                limits.tokens_used = 0
-                                limits.last_reset_time = current_time
 
-                            estimated_chunk_tokens = self.estimate_tokens(chunk_with_placeholders)
-                            if limits.requests_made >= limits.rpm or limits.tokens_used + estimated_chunk_tokens > limits.tpm or limits.daily_requests >= limits.rpd:
-                                wait_result = self._wait_for_available_model(estimated_chunk_tokens)
-                                if wait_result:
-                                    model_type, model, limits = wait_result
-                                    continue
-                                else:
-                                    break
+                        if self.validator.validate_chunk(chunk, current_output):
+                            translated_chunk = current_output
+                            actual_out       = self.estimate_tokens(response_text)
+                            total_tokens     = est_prompt + actual_out
+                            limits.tokens_used    += total_tokens
+                            limits.requests_made  += 1
+                            limits.daily_requests += 1
+                            limits.last_requests_made_per_request = 1
+                            limits.last_tokens_used_per_request   = total_tokens
+                            self._maybe_save_history()
+                            # Adaptive delay based on model RPM
+                            time.sleep(self._min_request_interval(limits))
+                            break
 
-                            prompt = create_translation_prompt(chunk_with_placeholders, source_lang, target_lang, self.active_placeholders, is_continuation=use_continuation)
-                            estimated_prompt_tokens = self.estimate_tokens(prompt)
-                            
-                            if self.stop_event and self.stop_event.is_set():
-                                return None
-                            response = self.client.models.generate_content(
-                                model=model,
-                                contents=prompt,
-                                config={
-                                    "temperature": 0.3,
-                                    "maxOutputTokens": estimated_prompt_tokens * 2,
-                                    "safety_settings": [
-                                                {
-                                                    "category": HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
-                                                    "threshold": HarmBlockThreshold.BLOCK_NONE,
-                                                },
-                                                {
-                                                    "category": HarmCategory.HARM_CATEGORY_HATE_SPEECH,
-                                                    "threshold": HarmBlockThreshold.BLOCK_NONE,
-                                                },
-                                                {
-                                                    "category": HarmCategory.HARM_CATEGORY_HARASSMENT,
-                                                    "threshold": HarmBlockThreshold.BLOCK_NONE,
-                                                },
-                                                {
-                                                    "category": HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
-                                                    "threshold": HarmBlockThreshold.BLOCK_NONE,
-                                                },
-                                            ],
-                                }
-                            )
+                    except (exceptions.ResourceExhausted, exceptions.ServiceUnavailable,
+                            errors.ClientError) as e:
+                        self.logger.error(f"API error (translation): {e}")
+                        retry_delay = self._extract_retry_delay(e, attempt)
+                        self.logger.warning(f"Rate limit: waiting {retry_delay:.1f}s")
+                        time.sleep(retry_delay + random.uniform(0, 1))
+                        if attempt == self.RETRY_ATTEMPTS - 1:
+                            break
+                    except Exception as e:
+                        self.logger.warning(f"Translation attempt {attempt + 1} failed: {e}")
+                        self._interruptible_sleep((2 ** attempt) + random.uniform(0, 1))
+                        if attempt == self.RETRY_ATTEMPTS - 1:
+                            break
 
-                            if response.prompt_feedback and response.prompt_feedback.block_reason:
-                                translated_chunk_text = chunk_with_placeholders
-                                chunk_translated_successfully = True
-                                break
+                translated_chunks.append(translated_chunk)
+                self.chunk_count_in_chapter += 1
 
-                            response_text = response.text if response.text is not None else ""
-                            current_translated_chunk = response_text.strip()
+            # Restore glossary placeholders 
+            combined = "\n\n".join(translated_chunks)
+            if self.glossary_manager:
+                self.glossary_manager._validate_glossary_restoration(
+                    processed_text, combined, self.active_placeholders
+                )
+                final_restored = self.glossary_manager.restore_placeholders(
+                    combined, self.active_placeholders
+                )
+            else:
+                final_restored = combined
+            self.active_placeholders = {}
 
-                            placeholder_missing = False
-                            for placeholder in self.active_placeholders:
-                                if placeholder in chunk_with_placeholders and placeholder not in current_translated_chunk:
-                                    placeholder_missing = True
-                                    break
-                                    
-                            if placeholder_missing:
-                                if attempt == self.RETRY_ATTEMPTS - 1:
-                                    translated_chunk_text = chunk_with_placeholders
-                                    chunk_translated_successfully = True
-                                    break
-                                continue
+            post_processed = self._post_process_translation(final_restored)
+            final_text     = reconstruct_whitespace(post_processed, whitespace_info)
+            self.translation_count += 1
+            return final_text
 
-                            if not current_translated_chunk or len(current_translated_chunk) < self.MIN_RESPONSE_LENGTH:
-                                if attempt == self.RETRY_ATTEMPTS - 1:
-                                    translated_chunk_text = chunk_with_placeholders
-                                    chunk_translated_successfully = True
-                                else:
-                                    raise ValueError("Empty or short response received.")
-                                continue
-
-                            if self.validator.validate_chunk(chunk_with_placeholders, current_translated_chunk):
-                                translated_chunk_text = current_translated_chunk
-                                chunk_translated_successfully = True
-                                actual_output_tokens = self.estimate_tokens(response_text)
-                                total_tokens = estimated_prompt_tokens + actual_output_tokens
-                                
-                                limits.tokens_used += total_tokens
-                                limits.requests_made += 1
-                                limits.daily_requests += 1
-                                limits.last_requests_made_per_request = 1
-                                limits.last_tokens_used_per_request = total_tokens
-                                self._save_history()
-                                time.sleep(self.BURST_DELAY)
-                                break
-                            else:
-                                if attempt == self.RETRY_ATTEMPTS - 1:
-                                    translated_chunk_text = chunk_with_placeholders
-                                    chunk_translated_successfully = True
-
-                        except (exceptions.ResourceExhausted, exceptions.ServiceUnavailable, errors.ClientError) as e:
-                            
-                            retry_delay = (2 ** attempt)
-                          
-                            if hasattr(e, 'retry_delay') and e.retry_delay:
-                                retry_delay = e.retry_delay.total_seconds()
-                            
-                            elif isinstance(e, errors.ClientError):
-                                try:
-                                    match = re.search(r"'retryDelay':\s*'(\d+(?:\.\d+)?)s'", str(e))
-                                    if match:
-                                        retry_delay = float(match.group(1))
-                                except Exception:
-                                    pass 
-                            
-                            self.logger.warning(f"Rate limit hit. Waiting {retry_delay:.2f}s before attempt {attempt + 2}")
-                            time.sleep(retry_delay + random.uniform(0, 1))
-                            
-                            if attempt == self.RETRY_ATTEMPTS - 1:
-                                translated_chunk_text = chunk_with_placeholders
-                                chunk_translated_successfully = True
-                        except Exception as e:
-                            sleep_duration = (2 ** attempt) + random.uniform(0, 1)
-                            self._interruptible_sleep(sleep_duration)
-                            if attempt == self.RETRY_ATTEMPTS - 1:
-                                translated_chunk_text = chunk_with_placeholders
-                                chunk_translated_successfully = True
-
-                    translated_chunks.append(translated_chunk_text)
-                    self.chunk_count_in_chapter += 1
-
-                combined_translated_text_with_placeholders = '\n\n'.join(translated_chunks)
-
-                if self.glossary_manager:
-                    self.glossary_manager._validate_glossary_restoration(processed_text_with_placeholders, combined_translated_text_with_placeholders, self.active_placeholders)
-                    final_translated_text_restored = self.glossary_manager.restore_placeholders(combined_translated_text_with_placeholders, self.active_placeholders)
-                else:
-                    final_translated_text_restored = combined_translated_text_with_placeholders
-
-                self.active_placeholders = {}
-                post_processed_text = self._post_process_translation(final_translated_text_restored)
-                final_text = reconstruct_whitespace(post_processed_text, whitespace_info)
-                self.translation_count += 1
-                
-                return final_text
-
-            except Exception as e:
-                self.logger.error(f"An unhandled error occurred during translation of a text block: {e}", exc_info=True)
-                self._save_history()
-                self.active_placeholders = {}
-                _, whitespace_info_fallback = extract_whitespace_info(original_text)
-                return reconstruct_whitespace(original_text.strip(), whitespace_info_fallback)
+        except Exception as e:
+            self.logger.error(f"Unhandled error in translate_text: {e}", exc_info=True)
+            self._maybe_save_history(force=True)
+            self.active_placeholders = {}
+            _, wsi = extract_whitespace_info(original_text)
+            return reconstruct_whitespace(original_text.strip(), wsi)
 
     def get_model_status(self) -> Dict:
-        """Returns detailed status of all models including current rate limits and estimates."""
         status = {}
         current_time = time.time()
-
         for model_type, model_info in self.models.items():
-            limits = model_info['limits']
-
-            # Calculate remaining limits considering the reset window
-            time_since_reset = current_time - limits.last_reset_time
-            remaining_rpm = max(0, limits.rpm - limits.requests_made) if time_since_reset < 60 else limits.rpm
-            remaining_tpm = max(0, limits.tpm - limits.tokens_used) if time_since_reset < 60 else limits.tpm
-
-            time_since_daily_reset = current_time - limits.last_daily_reset
-            remaining_rpd = max(0, limits.rpd - limits.daily_requests) if time_since_daily_reset < 86400 else limits.rpd
-
-
-            # Estimate remaining chapters based on RPD and configured max_chapters_per_day
-            estimated_chapters_remaining_by_rpd = max(0, limits.rpd - limits.daily_requests) # Assuming 1 request per chapter
-            estimated_chapters_remaining_by_config = max(0, limits.max_chapters_per_day - limits.daily_requests) # Based on configured chapters/day
-            estimated_chapters_remaining = min(
-                estimated_chapters_remaining_by_rpd,
-                estimated_chapters_remaining_by_config
+            lim = model_info['limits']
+            since_reset = current_time - lim.last_reset_time
+            since_daily = current_time - lim.last_daily_reset
+            remaining_rpm = max(0, lim.rpm - lim.requests_made) if since_reset < 60 else lim.rpm
+            remaining_tpm = max(0, lim.tpm - lim.tokens_used)   if since_reset < 60 else lim.tpm
+            remaining_rpd = max(0, lim.rpd - lim.daily_requests) if since_daily < 86400 else lim.rpd
+            est_chaps_remaining = min(
+                max(0, lim.rpd - lim.daily_requests),
+                max(0, lim.max_chapters_per_day - lim.daily_requests),
             )
-            estimated_chapters_remaining = max(0, estimated_chapters_remaining) # Ensure it's not negative
-
-
             status[model_type.value] = {
-                'model_name': model_info.get('model_name', 'N/A'),
-                'priority': model_info.get('priority', 'N/A'),
-                'available': model_info.get('available', False) and model_info.get('model_instance') is not None, # True if initialized and available flag is True
+                'model_name':  model_info.get('model_name', 'N/A'),
+                'priority':    model_info.get('priority', 'N/A'),
+                'available':   (model_info.get('available', False)
+                                and model_info.get('model_instance') is not None),
                 'limits': {
-                    'tpm': limits.tpm,
-                    'rpd': limits.rpd,
-                    'rpm': limits.rpm,
-                    'max_input_tokens': limits.max_input_tokens,
-                    'max_chapters_per_day': limits.max_chapters_per_day,
-                    'tokens_per_chapter': limits.tokens_per_chapter,
+                    'tpm': lim.tpm, 'rpd': lim.rpd, 'rpm': lim.rpm,
+                    'max_input_tokens': lim.max_input_tokens,
+                    'max_chapters_per_day': lim.max_chapters_per_day,
                 },
                 'current_usage': {
-                    'requests_made_current_minute': limits.requests_made,
-                    'tokens_used_current_minute': limits.tokens_used,
-                    'daily_requests': limits.daily_requests,
+                    'requests_made_current_minute': lim.requests_made,
+                    'tokens_used_current_minute':   lim.tokens_used,
+                    'daily_requests':               lim.daily_requests,
                 },
                 'remaining': {
                     'remaining_rpm': remaining_rpm,
                     'remaining_tpm': remaining_tpm,
                     'remaining_rpd': remaining_rpd,
-                    'estimated_chapters_remaining_today': estimated_chapters_remaining,
+                    'estimated_chapters_remaining_today': est_chaps_remaining,
                 },
-                'last_reset_time': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(limits.last_reset_time)),
-                'last_daily_reset': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(limits.last_daily_reset)),
-                'last_requests_made_per_request': limits.last_requests_made_per_request, # Usage from the last successful request
-                'last_tokens_used_per_request': limits.last_tokens_used_per_request,
+                'last_reset_time':  time.strftime('%Y-%m-%d %H:%M:%S',
+                                                  time.localtime(lim.last_reset_time)),
+                'last_daily_reset': time.strftime('%Y-%m-%d %H:%M:%S',
+                                                  time.localtime(lim.last_daily_reset)),
+                'last_requests_made_per_request': lim.last_requests_made_per_request,
+                'last_tokens_used_per_request':   lim.last_tokens_used_per_request,
             }
         return status
 
     def get_daily_chapter_capacity(self) -> int:
-        """
-        Returns total theoretical daily chapter capacity across all available models based on their configured `max_chapters_per_day`.
-        Note: The actual capacity is limited by the sum of *remaining* capacities.
-        """
-        total_configured_capacity = 0
+        total = 0
         for model_info in self.models.values():
-            if model_info.get('available', True) and model_info.get('model_instance') is not None:
-                total_configured_capacity += model_info['limits'].max_chapters_per_day
-        return total_configured_capacity
+            if model_info.get('available') and model_info.get('model_instance') is not None:
+                total += model_info['limits'].max_chapters_per_day
+        return total
 
     def optimize_for_chapters(self, estimated_chapters: int):
-        """
-        Optimizes model priority order based on estimated chapter count and models' *remaining* daily capacity (RPD and max_chapters_per_day).
-        This function also performs the daily reset for all models if needed.
-        """
         self.model_priority_order = self._calculate_optimal_model_for_chapters(estimated_chapters)
-
-        # Provide feedback on remaining capacity after optimization and reset
         status = self.get_model_status()
-        total_remaining_capacity_today = sum(
-            model_status['remaining']['estimated_chapters_remaining_today']
-            for model_status in status.values() if model_status['available']
+        total_remaining = sum(
+            s['remaining']['estimated_chapters_remaining_today']
+            for s in status.values() if s['available']
         )
-
-        self.logger.info(f"Optimization complete for estimated {estimated_chapters} chapters.")
-        self.logger.info(f"Current total remaining estimated chapter capacity today across available models: {total_remaining_capacity_today}.")
-        self.logger.info(f"New Model Priority Order: {[model.value for model in self.model_priority_order]}")
-
-        if estimated_chapters > total_remaining_capacity_today and total_remaining_capacity_today > 0:
-             # Find the earliest time a daily limit will reset among initialized models
-             earliest_reset_time = float('inf')
-             any_initialized = False
-             for model_info in self.models.values():
-                 if model_info.get('model_instance') is not None:
-                     any_initialized = True
-                     earliest_reset_time = min(earliest_reset_time, model_info['limits'].last_daily_reset + 86400) # 86400 seconds in a day
-
-             if any_initialized:
-                time_until_earliest_reset = max(0, earliest_reset_time - time.time())
-                self.logger.warning(
-                    f"Estimated chapters ({estimated_chapters}) exceeds total *remaining* estimated chapter capacity today ({total_remaining_capacity_today}). "
-                    f"Translation of all chapters may require waiting for daily limits to reset (approx {time_until_earliest_reset:.0f}s until earliest model reset)."
-                 )
-             else:
-                 self.logger.warning(f"Estimated chapters ({estimated_chapters}) exceeds total *remaining* estimated chapter capacity today ({total_remaining_capacity_today}). No models initialized to estimate reset time.")
-
-        elif estimated_chapters > 0 and total_remaining_capacity_today == 0:
-             self.logger.warning(
-                 f"Estimated chapters ({estimated_chapters}) requires translation, but no models have remaining daily capacity. "
-                 f"Translation cannot proceed until daily limits reset. Check get_model_status() for reset times."
-             )
-        elif estimated_chapters > 0:
-             self.logger.info(f"Estimated chapters ({estimated_chapters}) is within current total remaining capacity ({total_remaining_capacity_today}).")
+        self.logger.info(
+            f"Optimised for {estimated_chapters} chapters. "
+            f"Total remaining capacity today: {total_remaining}. "
+            f"Priority order: {[m.value for m in self.model_priority_order]}"
+        )
+        if estimated_chapters > total_remaining > 0:
+            earliest_reset = min(
+                (info['limits'].last_daily_reset + 86400
+                 for info in self.models.values() if info.get('model_instance')),
+                default=time.time() + 86400,
+            )
+            wait_secs = max(0, earliest_reset - time.time())
+            self.logger.warning(
+                f"Estimated {estimated_chapters} chapters exceeds remaining capacity "
+                f"({total_remaining}). Earliest reset in {wait_secs:.0f}s."
+            )
+        elif estimated_chapters > 0 and total_remaining == 0:
+            self.logger.warning(
+                "No remaining daily capacity. Wait for daily limits to reset."
+            )
 
     def save_state(self):
-        """Save glossary and history safely."""
         try:
             if self.glossary_manager:
                 self.glossary_manager.save_glossary()
@@ -1076,25 +863,27 @@ class GeminiTranslator:
             self.logger.info("Translator state saved.")
         except Exception as e:
             self.logger.error(f"Failed to save state: {e}")
-        
+
     def reset(self):
-        """Resets session counters and all model usage statistics, and optionally clears glossary."""
         self.translation_count = 0
         current_time = time.time()
         for model_info in self.models.values():
-            limits = model_info['limits']
-            limits.requests_made = 0
-            limits.tokens_used = 0
-            limits.daily_requests = 0
-            limits.last_reset_time = current_time
-            limits.last_daily_reset = current_time
-        self.logger.info("Translator session and model usage history reset complete.")
+            lim = model_info['limits']
+            lim.requests_made  = 0
+            lim.tokens_used    = 0
+            lim.daily_requests = 0
+            lim.last_reset_time  = current_time
+            lim.last_daily_reset = current_time
+        self.logger.info("Translator session and usage history reset.")
         self._save_history()
 
     def get_translation_count(self) -> int:
-        """Returns count of text blocks (not chunks) translated in current session."""
         return self.translation_count
 
     def get_remaining_translations(self) -> int:
-        """Returns estimated remaining translations in current session based on session limit."""
         return max(0, self.max_translations_per_session - self.translation_count)
+
+    def stop(self):
+        """Signal the translator to stop (for GUI stop button)."""
+        if self.stop_event:
+            self.stop_event.set()
